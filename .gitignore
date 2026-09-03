@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+MINECRAFT_RESOURCEPACK_TOOLS.code-workspace
+ref/
+backup/
