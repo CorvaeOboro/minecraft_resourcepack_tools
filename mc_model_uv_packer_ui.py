@@ -625,6 +625,313 @@ def _pack_islands_shelf(
 #endregion
 
 
+#region PACKER-FILL
+# Secondary packing pass: detects blank space left by the shelf packer and
+# relocates groups of similar (volume/proportion-matched) islands into the
+# gaps. Prioritizes overflow islands first, then compacts by pulling
+# bottom-row islands up into available space. Runs multiple passes so that
+# positions vacated by earlier moves become available for later ones.
+
+
+def _similarity_key(c: Cuboid) -> tuple[int, float, float]:
+    """Quantized similarity key based on element volume and proportions."""
+    dx, dy, dz = c.size()
+    vol = dx * dy * dz
+    vol_bucket = int(round(math.log2(max(vol, 0.0625))))
+    total = dx + dy + dz
+    if total > 1e-6:
+        nx = round(dx / total * 4.0) / 4.0
+        ny = round(dy / total * 4.0) / 4.0
+    else:
+        nx = ny = 0.0
+    return (vol_bucket, nx, ny)
+
+
+def _compute_free_rects(
+    occupied: list[tuple[int, int, int, int]],
+    lo: int,
+    hi_x: int,
+    hi_y: int,
+    min_w: int,
+    min_h: int,
+) -> list[tuple[int, int, int, int]]:
+    """Compute maximal free rectangles within [lo,hi_x] x [lo,hi_y] given occupied rects.
+
+    Uses the standard split-and-prune approach: start with the full interior
+    as the only free rect, then for each occupied rect, split every
+    overlapping free rect into up to 4 non-overlapping sub-rects.
+    """
+    free: list[tuple[int, int, int, int]] = [(lo, lo, hi_x, hi_y)]
+
+    for (ox0, oy0, ox1, oy1) in occupied:
+        ox0 = max(lo, ox0)
+        oy0 = max(lo, oy0)
+        ox1 = min(hi_x, ox1)
+        oy1 = min(hi_y, oy1)
+        if ox1 <= ox0 or oy1 <= oy0:
+            continue
+
+        new_free: list[tuple[int, int, int, int]] = []
+        for (fx0, fy0, fx1, fy1) in free:
+            if ox1 <= fx0 or ox0 >= fx1 or oy1 <= fy0 or oy0 >= fy1:
+                new_free.append((fx0, fy0, fx1, fy1))
+                continue
+            if ox0 > fx0:
+                new_free.append((fx0, fy0, ox0, fy1))
+            if ox1 < fx1:
+                new_free.append((ox1, fy0, fx1, fy1))
+            if oy0 > fy0:
+                new_free.append((fx0, fy0, fx1, oy0))
+            if oy1 < fy1:
+                new_free.append((fx0, oy1, fx1, fy1))
+        free = new_free
+
+    free = [(x0, y0, x1, y1) for (x0, y0, x1, y1) in free
+            if (x1 - x0) >= min_w and (y1 - y0) >= min_h]
+    return free
+
+
+def _secondary_fill_pass(
+    *,
+    packed: list[PackedIsland],
+    cuboids: list[Cuboid],
+    tex_w: int,
+    tex_h: int,
+    island_pad_px: int,
+    border_pad_px: int,
+    snap_px: int,
+    max_passes: int = 3,
+) -> tuple[list[PackedIsland], int]:
+    """Secondary pass: relocate groups of similar islands into blank space.
+
+    After the initial shelf pack, detects free rectangles within the atlas
+    and relocates islands into them.  Prioritizes overflow islands, then
+    compacts by moving bottom-row islands up.  Groups similar islands
+    (by volume and proportions) so siblings stay together.
+
+    Returns (updated_packed_list, total_relocated).
+    """
+    if not packed or len(packed) < 2:
+        return packed, 0
+
+    pad = max(0, int(island_pad_px))
+    border = max(0, int(border_pad_px))
+    snap = max(1, int(snap_px))
+    lo = border
+    hi_x = int(tex_w) - border
+    hi_y = int(tex_h) - border
+
+    pos: list[list[int]] = []
+    for pi in packed:
+        pos.append([int(pi.x_px), int(pi.y_px)])
+
+    overflow_flags = [bool(pi.overflow) for pi in packed]
+    sizes = [pi.island.size() for pi in packed]
+
+    def sim_key(i: int) -> tuple:
+        idx = int(packed[i].island.element_idx)
+        if 0 <= idx < len(cuboids):
+            return _similarity_key(cuboids[idx])
+        return (0, 0.0, 0.0)
+
+    total_relocated = 0
+
+    for _pass in range(max_passes):
+        occupied: list[tuple[int, int, int, int]] = []
+        for i in range(len(packed)):
+            w, h = sizes[i]
+            ox0 = pos[i][0] - pad
+            oy0 = pos[i][1] - pad
+            ox1 = pos[i][0] + w + pad
+            oy1 = pos[i][1] + h + pad
+            occupied.append((ox0, oy0, ox1, oy1))
+
+        min_fw = min((w + pad * 2 for w, h in sizes), default=hi_x - lo)
+        min_fh = min((h + pad * 2 for w, h in sizes), default=hi_y - lo)
+
+        free_rects = _compute_free_rects(occupied, lo, hi_x, hi_y, min_fw, min_fh)
+        free_rects.sort(key=lambda r: (r[2] - r[0]) * (r[3] - r[1]), reverse=True)
+
+        if not free_rects:
+            break
+
+        max_y = max((pos[i][1] + sizes[i][1] for i in range(len(packed))), default=0)
+
+        moved_this_pass: set[int] = set()
+        new_pos: dict[int, tuple[int, int]] = {}
+
+        for fr in free_rects:
+            fr_x0, fr_y0, fr_x1, fr_y1 = fr
+            fr_w = fr_x1 - fr_x0
+            fr_h = fr_y1 - fr_y0
+
+            candidates: list[int] = []
+            for i in range(len(packed)):
+                if i in moved_this_pass:
+                    continue
+                if not overflow_flags[i]:
+                    continue
+                w, h = sizes[i]
+                if w + pad * 2 <= fr_w and h + pad * 2 <= fr_h:
+                    candidates.append(i)
+
+            bottom_threshold = max_y * 0.75
+            compaction_candidates: list[int] = []
+            for i in range(len(packed)):
+                if i in moved_this_pass:
+                    continue
+                if overflow_flags[i]:
+                    continue
+                y_bot = pos[i][1] + sizes[i][1]
+                if y_bot >= bottom_threshold:
+                    w, h = sizes[i]
+                    if w + pad * 2 <= fr_w and h + pad * 2 <= fr_h:
+                        compaction_candidates.append(i)
+            candidates.extend(compaction_candidates)
+
+            if not candidates:
+                continue
+
+            cand_groups: dict[tuple, list[int]] = {}
+            for i in candidates:
+                key = sim_key(i)
+                cand_groups.setdefault(key, []).append(i)
+            sorted_groups = sorted(cand_groups.values(), key=len, reverse=True)
+
+            cx = fr_x0 + pad
+            cy = fr_y0 + pad
+            row_h = 0
+
+            for group in sorted_groups:
+                group_sorted = sorted(group, key=lambda i: sizes[i][1], reverse=True)
+                for i in group_sorted:
+                    if i in moved_this_pass:
+                        continue
+                    w, h = sizes[i]
+                    fw = w + pad * 2
+                    fh = h + pad * 2
+
+                    if cx + fw > fr_x1 + 1 and cx > fr_x0 + pad:
+                        cx = fr_x0 + pad
+                        cy += int(_snap_int(row_h, snap))
+                        row_h = 0
+
+                    if cy + fh > fr_y1 + 1:
+                        continue
+
+                    new_y_bot = int(cy) + h
+                    cur_y_bot = pos[i][1] + h
+                    if not overflow_flags[i] and new_y_bot >= cur_y_bot:
+                        continue
+
+                    new_pos[i] = (int(cx), int(cy))
+                    moved_this_pass.add(i)
+                    cx += int(_snap_int(fw, snap))
+                    row_h = max(row_h, fh)
+
+        if not moved_this_pass:
+            break
+
+        for i, (nx, ny) in new_pos.items():
+            pos[i][0] = nx
+            pos[i][1] = ny
+            w, h = sizes[i]
+            overflow_flags[i] = bool(nx + w > hi_x or ny + h > hi_y)
+
+        total_relocated += len(moved_this_pass)
+
+    if total_relocated == 0:
+        return packed, 0
+
+    result: list[PackedIsland] = []
+    for i, pi in enumerate(packed):
+        result.append(PackedIsland(
+            island=pi.island,
+            x_px=pos[i][0],
+            y_px=pos[i][1],
+            overflow=overflow_flags[i],
+        ))
+
+    return result, total_relocated
+#endregion
+
+
+#region TEXEL-DESC
+# Natural-language texel density summary for the log panel.
+# Describes the smallest and largest face UV footprints in pixel space,
+# plus aggregate stats (average, total used area, atlas utilization).
+
+
+def _describe_texel_density(
+    *,
+    packed: list[PackedIsland],
+    tex_w: int,
+    tex_h: int,
+) -> list[str]:
+    """Generate natural-language texel density description for the log.
+
+    Examines every face placement in every packed island and reports:
+    - Smallest face: element index, face name, pixel dimensions
+    - Largest face: element index, face name, pixel dimensions
+    - Average face size, total faces, atlas utilization percentage
+    """
+    if not packed:
+        return ["No faces to analyze."]
+
+    faces_info: list[tuple[int, str, int, int, int]] = []
+    total_area = 0
+
+    for pisl in packed:
+        el_idx = int(pisl.island.element_idx)
+        for pl in pisl.island.placements:
+            w = max(1, int(pl.w_px))
+            h = max(1, int(pl.h_px))
+            area = w * h
+            total_area += area
+            faces_info.append((el_idx, str(pl.face), w, h, area))
+
+    if not faces_info:
+        return ["No face placements found."]
+
+    faces_info.sort(key=lambda t: t[4])
+
+    smallest = faces_info[0]
+    largest = faces_info[-1]
+
+    avg_area = total_area / len(faces_info)
+    avg_side = math.sqrt(avg_area)
+
+    atlas_area = int(tex_w) * int(tex_h)
+    utilization = (total_area / atlas_area * 100.0) if atlas_area > 0 else 0.0
+
+    lines: list[str] = []
+    lines.append("")
+    lines.append("Texel density summary:")
+    lines.append(
+        f"  Smallest face: element {smallest[0]:03d} {smallest[1]} = "
+        f"{smallest[2]}x{smallest[3]} px ({smallest[4]} px^2)"
+    )
+    lines.append(
+        f"  Largest face:  element {largest[0]:03d} {largest[1]} = "
+        f"{largest[2]}x{largest[3]} px ({largest[4]} px^2)"
+    )
+    lines.append(
+        f"  {len(faces_info)} faces total, average ~{avg_side:.1f}x{avg_side:.1f} px "
+        f"({avg_area:.0f} px^2), atlas utilization {utilization:.1f}%"
+    )
+
+    tiny = [f for f in faces_info if f[2] <= 2 or f[3] <= 2]
+    if tiny:
+        names = ", ".join(f"el{f[0]:03d}:{f[1]}({f[2]}x{f[3]})" for f in tiny[:8])
+        extra = f" ... +{len(tiny)-8} more" if len(tiny) > 8 else ""
+        lines.append(
+            f"  NOTE: {len(tiny)} face(s) are very small (<=2px on one axis): {names}{extra}"
+        )
+
+    return lines
+#endregion
+
+
 #region UVWRITE
 # UV write-back: deep-copies the model, then writes packed UV rects into each
 # face dict. Supports px / norm / mc16 output units. mc16 gets clamping + min-step.
@@ -1404,6 +1711,11 @@ class AtlasPreview(QtWidgets.QGraphicsView):
         self._is_panning = False
         self._pan_last: Optional[QtCore.QPoint] = None
         self._user_view = False
+        self._show_labels = True
+
+    def set_show_labels(self, enabled: bool) -> None:
+        self._show_labels = bool(enabled)
+        self.update()
 
     def _set_user_view(self) -> None:
         self._user_view = True
@@ -1458,7 +1770,7 @@ class AtlasPreview(QtWidgets.QGraphicsView):
         tex_h: int,
         packed: list[PackedIsland],
         colors_by_element: Optional[dict[int, QtGui.QColor]] = None,
-        selected_element: Optional[int] = None,
+        selected_element=None,
     ) -> None:
         tex_w = int(tex_w)
         tex_h = int(tex_h)
@@ -1468,6 +1780,13 @@ class AtlasPreview(QtWidgets.QGraphicsView):
 
         self._tex_w = int(tex_w)
         self._tex_h = int(tex_h)
+
+        if selected_element is None:
+            sel_set: set[int] = set()
+        elif isinstance(selected_element, int):
+            sel_set = {int(selected_element)}
+        else:
+            sel_set = {int(x) for x in selected_element}
 
         self._scene.clear()
         self._scene.setSceneRect(0, 0, float(tex_w), float(tex_h))
@@ -1488,7 +1807,6 @@ class AtlasPreview(QtWidgets.QGraphicsView):
         face_outline_overlap.setWidthF(2.5)
 
         text_pen = QtGui.QPen(QtGui.QColor(230, 230, 235, 180))
-        font = QtGui.QFont("Consolas", 8)
 
         def intersects(a: QtCore.QRectF, b: QtCore.QRectF) -> bool:
             x0 = max(float(a.left()), float(b.left()))
@@ -1498,6 +1816,7 @@ class AtlasPreview(QtWidgets.QGraphicsView):
             return (x1 - x0) > 1e-6 and (y1 - y0) > 1e-6
 
         drawn_rects: list[tuple[int, QtCore.QRectF, bool]] = []
+        placed_label_rects: list[QtCore.QRectF] = []
 
         for i, pisl in enumerate(packed):
             base = None
@@ -1507,7 +1826,7 @@ class AtlasPreview(QtWidgets.QGraphicsView):
                 base = _color_for_index(int(pisl.island.element_idx))
 
             alpha = 90
-            if selected_element is not None and int(pisl.island.element_idx) != int(selected_element):
+            if sel_set and int(pisl.island.element_idx) not in sel_set:
                 alpha = 40
             col = QtGui.QColor(base.red(), base.green(), base.blue(), alpha)
 
@@ -1524,7 +1843,7 @@ class AtlasPreview(QtWidgets.QGraphicsView):
                         break
 
                 pen = face_outline
-                if selected_element is not None and int(pisl.island.element_idx) == int(selected_element):
+                if sel_set and int(pisl.island.element_idx) in sel_set:
                     pen = face_outline_sel
                 if bool(pisl.overflow):
                     pen = face_outline_over
@@ -1534,12 +1853,32 @@ class AtlasPreview(QtWidgets.QGraphicsView):
 
                 drawn_rects.append((int(pisl.island.element_idx), r, overlap))
 
-                lab = f"{pisl.island.element_idx}:{pl.face}"
-                if int(pl.rot) % 360 != 0:
-                    lab += f" r{int(pl.rot)%360}"
-                t = self._scene.addText(lab, font)
-                t.setDefaultTextColor(text_pen.color())
-                t.setPos(x + 2.0, y + 1.0)
+                if self._show_labels:
+                    lab = f"{pisl.island.element_idx}:{pl.face}"
+                    if int(pl.rot) % 360 != 0:
+                        lab += f" r{int(pl.rot)%360}"
+                    rect_size = min(float(w), float(h))
+                    font_pt = max(4, min(14, int(rect_size * 0.14)))
+                    lab_font = QtGui.QFont("Consolas", font_pt)
+                    t = self._scene.addText(lab, lab_font)
+                    t.setDefaultTextColor(text_pen.color())
+                    tw = t.boundingRect().width()
+                    th = t.boundingRect().height()
+                    candidates = [
+                        (x + 2.0, y + 1.0),
+                        (x + w - tw - 2.0, y + 1.0),
+                        (x + 2.0, y + h - th - 1.0),
+                        (x + w - tw - 2.0, y + h - th - 1.0),
+                        (x + (w - tw) * 0.5, y + (h - th) * 0.5),
+                    ]
+                    best_pos = candidates[0]
+                    for cx, cy in candidates:
+                        lr = QtCore.QRectF(cx, cy, tw, th)
+                        if not any(intersects(lr, pr) for pr in placed_label_rects):
+                            best_pos = (cx, cy)
+                            break
+                    placed_label_rects.append(QtCore.QRectF(best_pos[0], best_pos[1], tw, th))
+                    t.setPos(best_pos[0], best_pos[1])
 
         def stable_hash(s: str) -> int:
             h = 2166136261
@@ -1593,8 +1932,7 @@ class AtlasPreview(QtWidgets.QGraphicsView):
             "down": {"top": "south", "bottom": "north", "left": "west", "right": "east"},
         }
 
-        if selected_element is not None:
-            sel = int(selected_element)
+        for sel in sel_set:
             sel_item = next((pi for pi in packed if int(pi.island.element_idx) == sel), None)
             if sel_item is not None:
                 by_face: dict[str, tuple[QtCore.QRectF, int]] = {}
@@ -1677,13 +2015,23 @@ class UVModelViewport(QtWidgets.QWidget):
         self._shade_only_central = False
         self._draw_faces = True
         self._draw_wireframe = True
+        self._draw_face_label = True
+        self._draw_element_id = False
 
-        self._selected: Optional[int] = None
+        self._selected: set[int] = set()
 
     def set_render_options(self, *, faces: bool, wireframe: bool, shade_only_central: bool) -> None:
         self._draw_faces = bool(faces)
         self._draw_wireframe = bool(wireframe)
         self._shade_only_central = bool(shade_only_central)
+        self.update()
+
+    def set_draw_face_label(self, enabled: bool) -> None:
+        self._draw_face_label = bool(enabled)
+        self.update()
+
+    def set_draw_element_id(self, enabled: bool) -> None:
+        self._draw_element_id = bool(enabled)
         self.update()
 
     def set_cuboids(
@@ -1698,8 +2046,13 @@ class UVModelViewport(QtWidgets.QWidget):
         self._central_faces = list(central_faces) if central_faces is not None else []
         self.update()
 
-    def set_selected(self, idx: Optional[int]) -> None:
-        self._selected = None if idx is None else int(idx)
+    def set_selected(self, idx) -> None:
+        if idx is None:
+            self._selected = set()
+        elif isinstance(idx, int):
+            self._selected = {int(idx)}
+        else:
+            self._selected = {int(x) for x in idx}
         self.update()
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
@@ -1719,7 +2072,7 @@ class UVModelViewport(QtWidgets.QWidget):
         if event.button() == QtCore.Qt.MouseButton.RightButton:
             idx = self._pick_cuboid(event.position())
             if idx is not None:
-                self._selected = int(idx)
+                self._selected = {int(idx)}
                 self.selectionChanged.emit(int(idx))
                 self.update()
             event.accept()
@@ -1736,7 +2089,7 @@ class UVModelViewport(QtWidgets.QWidget):
                 if (dx * dx + dy * dy) <= 9:
                     idx = self._pick_cuboid(event.position())
                     if idx is not None:
-                        self._selected = int(idx)
+                        self._selected = {int(idx)}
                         self.selectionChanged.emit(int(idx))
                         self.update()
             self._last_mouse_pos = None
@@ -1902,7 +2255,7 @@ class UVModelViewport(QtWidgets.QWidget):
 
         faces: list[tuple[float, QtGui.QPolygonF, QtGui.QColor]] = []
 
-        label: Optional[tuple[QtCore.QPointF, str]] = None
+        labels: list[tuple[QtCore.QPointF, str, float]] = []
 
         face_letter = {
             "north": "N",
@@ -1961,11 +2314,16 @@ class UVModelViewport(QtWidgets.QWidget):
                     depth = (cam_pts[i0][2] + cam_pts[i1][2] + cam_pts[i2][2] + cam_pts[i3][2]) / 4.0
                     faces.append((depth, poly, col))
 
-                    if self._selected is not None and int(i_c) == int(self._selected) and central is not None and str(fname) == str(central):
-                        cx = (float(p0.x()) + float(p1.x()) + float(p2.x()) + float(p3.x())) / 4.0
-                        cy = (float(p0.y()) + float(p1.y()) + float(p2.y()) + float(p3.y())) / 4.0
+                    if self._draw_face_label and int(i_c) in self._selected and central is not None and str(fname) == str(central):
+                        xs = [float(p0.x()), float(p1.x()), float(p2.x()), float(p3.x())]
+                        ys = [float(p0.y()), float(p1.y()), float(p2.y()), float(p3.y())]
+                        cx = sum(xs) / 4.0
+                        cy = sum(ys) / 4.0
+                        face_w = max(xs) - min(xs)
+                        face_h = max(ys) - min(ys)
+                        face_size = max(face_w, face_h)
                         letter = face_letter.get(str(fname), str(fname)[:1].upper())
-                        label = (QtCore.QPointF(cx, cy), str(letter))
+                        labels.append((QtCore.QPointF(cx, cy), str(letter), float(face_size)))
 
             faces.sort(key=lambda it: it[0], reverse=True)
             painter.setPen(QtCore.Qt.PenStyle.NoPen)
@@ -1973,12 +2331,13 @@ class UVModelViewport(QtWidgets.QWidget):
                 painter.setBrush(QtGui.QBrush(col))
                 painter.drawPolygon(poly)
 
-            if label is not None:
-                pos, letter = label
+            for pos, letter, face_size in labels:
+                font_pt = max(8, min(36, int(face_size * 0.22)))
+                offset = max(1.0, font_pt * 0.12)
                 painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 220)))
-                f = QtGui.QFont("Consolas", 14, QtGui.QFont.Weight.Bold)
+                f = QtGui.QFont("Consolas", font_pt, QtGui.QFont.Weight.Bold)
                 painter.setFont(f)
-                painter.drawText(pos + QtCore.QPointF(1.5, 1.5), str(letter))
+                painter.drawText(pos + QtCore.QPointF(offset, offset), str(letter))
                 painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 240)))
                 painter.drawText(pos, str(letter))
 
@@ -1993,7 +2352,7 @@ class UVModelViewport(QtWidgets.QWidget):
                 line_col = QtGui.QColor(base_col.red(), base_col.green(), base_col.blue(), 235)
 
                 width = 1.35
-                if self._selected is not None and int(i_c) == int(self._selected):
+                if int(i_c) in self._selected:
                     width = 2.6
                     line_col = QtGui.QColor(255, 255, 255, 240)
 
@@ -2027,6 +2386,40 @@ class UVModelViewport(QtWidgets.QWidget):
                         continue
                     painter.drawLine(pa, pb)
 
+        if self._draw_element_id:
+            for i_c, c in enumerate(self._cuboids):
+                center = c.center()
+                cp = to_camera(center)
+                pp = project_cam(cp)
+                if pp is None:
+                    continue
+
+                base_col = _color_for_index(int(i_c))
+                if 0 <= int(i_c) < len(self._colors):
+                    base_col = self._colors[int(i_c)]
+
+                label_col = QtGui.QColor(base_col.red(), base_col.green(), base_col.blue(), 255)
+                shadow_col = QtGui.QColor(0, 0, 0, 200)
+
+                w = max(1, self.width())
+                h = max(1, self.height())
+                f = min(w, h) * 0.9
+                z = float(cp[2])
+                if z <= 0.05:
+                    continue
+                screen_size = (f / z) * 0.02
+                font_pt = max(7, min(28, int(screen_size * 14)))
+
+                text = str(int(i_c))
+                offset = max(1.0, font_pt * 0.12)
+
+                painter.setPen(QtGui.QPen(shadow_col))
+                ef = QtGui.QFont("Consolas", font_pt, QtGui.QFont.Weight.Bold)
+                painter.setFont(ef)
+                painter.drawText(pp + QtCore.QPointF(offset, offset), text)
+                painter.setPen(QtGui.QPen(label_col))
+                painter.drawText(pp, text)
+
         painter.end()
 #endregion
 
@@ -2047,6 +2440,7 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
 
         self._central_overrides: dict[int, Face] = {}
         self._selected_element: Optional[int] = None
+        self._selected_elements: list[int] = []
         self._element_colors: list[QtGui.QColor] = []
         self._last_central_faces: list[Optional[Face]] = []
 
@@ -2083,12 +2477,13 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
 
     def _sync_views(self) -> None:
         colors_by_element = {i: self._element_colors[i] for i in range(len(self._element_colors))}
+        self._preview.set_show_labels(bool(self._atlas_labels.isChecked()))
         self._preview.set_preview(
             tex_w=int(self._tex_w.value()),
             tex_h=int(self._tex_h.value()),
             packed=self._packed,
             colors_by_element=colors_by_element,
-            selected_element=self._selected_element,
+            selected_element=self._selected_elements,
         )
 
         self._viewport_3d.set_render_options(
@@ -2096,53 +2491,72 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
             wireframe=bool(self._vp_wire.isChecked()),
             shade_only_central=bool(self._vp_shade_only_central.isChecked()),
         )
+        self._viewport_3d.set_draw_face_label(bool(self._vp_face_label.isChecked()))
+        self._viewport_3d.set_draw_element_id(bool(self._vp_element_id.isChecked()))
         self._viewport_3d.set_cuboids(
             [e.cuboid for e in self._elements],
             colors=self._element_colors,
             central_faces=self._last_central_faces,
         )
-        self._viewport_3d.set_selected(self._selected_element)
+        self._viewport_3d.set_selected(self._selected_elements)
 
     def _on_viewport_selected(self, idx: int) -> None:
         if 0 <= int(idx) < self._lst_elements.count():
             self._lst_elements.setCurrentRow(int(idx))
 
-    def _on_select_element(self, row: int) -> None:
-        if row < 0 or row >= len(self._elements):
-            self._selected_element = None
-        else:
-            self._selected_element = int(self._elements[int(row)].idx)
+    def _on_selection_changed(self) -> None:
+        rows = sorted(i.row() for i in self._lst_elements.selectedItems())
+        selected: list[int] = []
+        for r in rows:
+            if 0 <= r < len(self._elements):
+                selected.append(int(self._elements[r].idx))
+        self._selected_elements = selected
+        self._selected_element = selected[0] if selected else None
 
-        sel = self._selected_element
-        self._btn_apply_override.setEnabled(sel is not None)
-        self._btn_clear_override.setEnabled(sel is not None and int(sel) in self._central_overrides)
+        has_sel = len(selected) > 0
+        any_override = any(int(s) in self._central_overrides for s in selected)
+        self._btn_clear_override.setEnabled(has_sel and any_override)
 
-        if sel is None:
-            self._override_face.setCurrentIndex(self._override_face.findData("auto"))
-        else:
-            ov = self._central_overrides.get(int(sel))
-            if ov is None:
-                self._override_face.setCurrentIndex(self._override_face.findData("auto"))
-            else:
-                self._override_face.setCurrentIndex(self._override_face.findData(str(ov)))
+        self._sync_override_face_display()
 
         self._sync_views()
 
-    def _on_apply_override(self) -> None:
-        if self._selected_element is None:
+    def _sync_override_face_display(self) -> None:
+        selected = self._selected_elements
+        if not selected:
+            self._override_face.blockSignals(True)
+            self._override_face.setCurrentIndex(self._override_face.findData("auto"))
+            self._override_face.blockSignals(False)
+        else:
+            overrides = [self._central_overrides.get(int(s)) for s in selected]
+            unique = set(overrides)
+            if len(unique) == 1:
+                ov = unique.pop()
+                target = "auto" if ov is None else str(ov)
+            else:
+                target = "auto"
+            self._override_face.blockSignals(True)
+            self._override_face.setCurrentIndex(self._override_face.findData(target))
+            self._override_face.blockSignals(False)
+
+    def _on_override_face_changed(self) -> None:
+        if not self._selected_elements:
             return
         v = str(self._override_face.currentData() or "auto")
-        if v == "auto":
-            self._central_overrides.pop(int(self._selected_element), None)
-        else:
-            self._central_overrides[int(self._selected_element)] = v  # type: ignore[assignment]
-        self._btn_clear_override.setEnabled(int(self._selected_element) in self._central_overrides)
+        for s in self._selected_elements:
+            if v == "auto":
+                self._central_overrides.pop(int(s), None)
+            else:
+                self._central_overrides[int(s)] = v  # type: ignore[assignment]
+        any_override = any(int(s) in self._central_overrides for s in self._selected_elements)
+        self._btn_clear_override.setEnabled(any_override)
         self._on_pack()
 
     def _on_clear_override(self) -> None:
-        if self._selected_element is None:
+        if not self._selected_elements:
             return
-        self._central_overrides.pop(int(self._selected_element), None)
+        for s in self._selected_elements:
+            self._central_overrides.pop(int(s), None)
         self._btn_clear_override.setEnabled(False)
         self._on_pack()
 
@@ -2181,6 +2595,12 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
         self._border_pad.setRange(0, 256)
         self._border_pad.setValue(2)
 
+        self._secondary_fill = QtWidgets.QCheckBox("Secondary fill pass")
+        self._secondary_fill.setChecked(True)
+        self._secondary_fill.setToolTip(
+            "After initial shelf pack, relocate groups of similar islands into blank space to improve packing density."
+        )
+
         self._prefer_horizontal = QtWidgets.QCheckBox("Prefer horizontal central face")
         self._prefer_horizontal.setChecked(True)
 
@@ -2188,6 +2608,7 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
         self._central_mode.addItem("Auto", userData="auto")
         for f in ("north", "south", "east", "west", "up", "down"):
             self._central_mode.addItem(str(f), userData=str(f))
+        self._central_mode.setCurrentIndex(self._central_mode.findData("up"))
 
         self._default_texture = QtWidgets.QLineEdit("#0")
 
@@ -2202,17 +2623,14 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
         self._write_rotation.setChecked(True)
 
         self._lst_elements = QtWidgets.QListWidget()
-        self._lst_elements.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        self._lst_elements.currentRowChanged.connect(self._on_select_element)
+        self._lst_elements.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._lst_elements.itemSelectionChanged.connect(self._on_selection_changed)
 
         self._override_face = QtWidgets.QComboBox()
         self._override_face.addItem("Auto", userData="auto")
         for f in ("north", "south", "east", "west", "up", "down"):
             self._override_face.addItem(str(f), userData=str(f))
-
-        self._btn_apply_override = QtWidgets.QPushButton("Apply central face")
-        self._btn_apply_override.clicked.connect(self._on_apply_override)
-        self._btn_apply_override.setEnabled(False)
+        self._override_face.currentIndexChanged.connect(self._on_override_face_changed)
 
         self._btn_clear_override = QtWidgets.QPushButton("Clear override")
         self._btn_clear_override.clicked.connect(self._on_clear_override)
@@ -2229,6 +2647,18 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
         self._vp_shade_only_central = QtWidgets.QCheckBox("Shade only central face")
         self._vp_shade_only_central.setChecked(False)
         self._vp_shade_only_central.stateChanged.connect(self._sync_views)
+
+        self._vp_face_label = QtWidgets.QCheckBox("3D face label")
+        self._vp_face_label.setChecked(True)
+        self._vp_face_label.stateChanged.connect(self._sync_views)
+
+        self._vp_element_id = QtWidgets.QCheckBox("3D element IDs")
+        self._vp_element_id.setChecked(False)
+        self._vp_element_id.stateChanged.connect(self._sync_views)
+
+        self._atlas_labels = QtWidgets.QCheckBox("Atlas face labels")
+        self._atlas_labels.setChecked(True)
+        self._atlas_labels.stateChanged.connect(self._sync_views)
 
         self._btn_pack = QtWidgets.QPushButton("Generate + Pack")
         self._btn_pack.setObjectName("btn_pack")
@@ -2299,6 +2729,7 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
         tex_form.addRow("Snap (px)", self._snap_px)
         tex_form.addRow("Island pad (px)", self._island_pad)
         tex_form.addRow("Border pad (px)", self._border_pad)
+        tex_form.addRow(self._secondary_fill)
 
         unwrap_box = QtWidgets.QGroupBox("Box unwrap")
         unwrap_form = QtWidgets.QFormLayout(unwrap_box)
@@ -2321,10 +2752,7 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
         row.addWidget(self._override_face)
         el_layout.addLayout(row)
 
-        row_btn = QtWidgets.QHBoxLayout()
-        row_btn.addWidget(self._btn_apply_override)
-        row_btn.addWidget(self._btn_clear_override)
-        el_layout.addLayout(row_btn)
+        el_layout.addWidget(self._btn_clear_override)
 
         view_box = QtWidgets.QGroupBox("3D")
         view_layout = QtWidgets.QVBoxLayout(view_box)
@@ -2333,6 +2761,9 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
         view_layout.addWidget(self._vp_faces)
         view_layout.addWidget(self._vp_wire)
         view_layout.addWidget(self._vp_shade_only_central)
+        view_layout.addWidget(self._vp_face_label)
+        view_layout.addWidget(self._vp_element_id)
+        view_layout.addWidget(self._atlas_labels)
 
         resnap_box = QtWidgets.QGroupBox("Resnap existing UVs")
         resnap_form = QtWidgets.QFormLayout(resnap_box)
@@ -2413,6 +2844,7 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
             self._elements = elements
             self._central_overrides = {}
             self._selected_element = None
+            self._selected_elements = []
             self._element_colors = [_color_for_index(i) for i in range(len(elements))]
             self._last_central_faces = [None] * len(elements)
             self._packed = []
@@ -2430,7 +2862,7 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
                 tex_h=int(self._tex_h.value()),
                 packed=[],
                 colors_by_element={i: self._element_colors[i] for i in range(len(self._element_colors))},
-                selected_element=self._selected_element,
+                selected_element=self._selected_elements,
             )
 
             self._lst_elements.clear()
@@ -2504,6 +2936,21 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
                 snap_px=snap_px,
             )
 
+            if bool(self._secondary_fill.isChecked()):
+                packed, relocated = _secondary_fill_pass(
+                    packed=packed,
+                    cuboids=[e.cuboid for e in self._elements],
+                    tex_w=tex_w,
+                    tex_h=tex_h,
+                    island_pad_px=island_pad,
+                    border_pad_px=border_pad,
+                    snap_px=snap_px,
+                )
+                if relocated > 0:
+                    lines.append(f"Secondary fill: relocated {relocated} island(s) into blank space.")
+
+            lines.extend(_describe_texel_density(packed=packed, tex_w=tex_w, tex_h=tex_h))
+
             out_model = _apply_uvs_to_model(
                 model=self._model,
                 packed=packed,
@@ -2523,7 +2970,7 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
                 tex_h=tex_h,
                 packed=packed,
                 colors_by_element={i: self._element_colors[i] for i in range(len(self._element_colors))},
-                selected_element=self._selected_element,
+                selected_element=self._selected_elements,
             )
             if any(bool(p.overflow) for p in packed):
                 lines.append("")
@@ -2594,12 +3041,14 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
             self._out_model = out_model
             self._packed = _uvs_to_packed_preview(model=out_model, tex_w=tex_w, tex_h=tex_h, uv_units=units)
 
+            log.extend(_describe_texel_density(packed=self._packed, tex_w=tex_w, tex_h=tex_h))
+
             self._preview.set_preview(
                 tex_w=tex_w,
                 tex_h=tex_h,
                 packed=self._packed,
                 colors_by_element={i: self._element_colors[i] for i in range(len(self._element_colors))},
-                selected_element=self._selected_element,
+                selected_element=self._selected_elements,
             )
 
             self._txt_log.setPlainText("\n".join(log))
