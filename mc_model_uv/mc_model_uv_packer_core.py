@@ -1157,14 +1157,17 @@ def _snap_island_coordinates(
     faces_data: list[dict],
     min_face_px: int,
     bias_gt_px: int,
+    bias_boundaries: bool = True,
 ) -> None:
     """Snap all unique x/y coordinates of an island to integers in-place.
 
     Uses a shared coordinate mapping so faces that originally shared an edge
-    continue to share an edge after snapping.  The island's outer boundary is
-    biased outward (floor min / ceil max) to nudge face sizes up; internal
-    coordinates round to nearest.  Monotonicity is enforced so no two distinct
-    coordinates collapse to the same integer.
+    continue to share an edge after snapping.  When ``bias_boundaries`` is
+    True (default, used by the packer), the island's outer boundary is biased
+    outward (floor min / ceil max) to nudge face sizes up.  When False (used
+    by resnap to preserve layout), all coordinates round to nearest.
+    Monotonicity is enforced so no two distinct coordinates collapse to the
+    same integer.
 
     After applying the shared map, each face is checked individually: if its
     width or height is below ``min_face_px``, the right/bottom edge is expanded
@@ -1187,21 +1190,35 @@ def _snap_island_coordinates(
     y_sorted = sorted(y_coords_set)
 
     def snap_axis(coords: list[float]) -> dict[float, int]:
-        """Snap sorted coordinates to monotonically increasing integers."""
+        """Snap sorted coordinates to monotonically increasing integers.
+
+        Coordinates closer than 0.5px are merged (mapped to the same integer)
+        to preserve edge-sharing without inflating the island span.
+        """
         n = len(coords)
         result: dict[float, int] = {}
         last = -(10 ** 18)
-        for i, c in enumerate(coords):
-            if i == 0:
+        i = 0
+        while i < n:
+            c = coords[i]
+            if bias_boundaries and i == 0:
                 s = int(math.floor(c))  # bias: expand left boundary
-            elif i == n - 1:
+            elif bias_boundaries and i == n - 1:
                 s = int(math.ceil(c))   # bias: expand right boundary
             else:
                 s = int(math.floor(c + 0.5))  # round half up
             if s <= last:
-                s = last + 1
+                # This coordinate would collide with the previous snapped value.
+                # If the original coordinates are very close (< 0.5px apart),
+                # merge them by using the same snapped value.  Otherwise,
+                # push apart to maintain monotonicity.
+                if i > 0 and abs(c - coords[i - 1]) < 0.5:
+                    s = last  # merge: same integer
+                else:
+                    s = last + 1  # too far apart to merge
             result[c] = s
             last = s
+            i += 1
 
         # Enforce min_face_px / bias_gt_px on the outermost span
         total = result[coords[-1]] - result[coords[0]]
@@ -1339,12 +1356,19 @@ def _resolve_island_overlaps(
     hi_y: int,
     pad: int,
     max_iter: int = 64,
+    preexisting_overlaps: Optional[set[tuple[int, int]]] = None,
 ) -> bool:
     """Nudge whole islands apart so every pair has at least ``pad`` px gap.
 
     Each island is translated as a unit (all faces move by the same delta),
     preserving internal connectivity.  Returns True if stable.
+
+    If ``preexisting_overlaps`` is provided, island pairs in that set are
+    skipped (they were already overlapping in the original layout and should
+    be preserved as-is, not separated).
     """
+    skip = preexisting_overlaps if preexisting_overlaps is not None else set()
+
     for _ in range(max_iter):
         moved = False
         bboxes = [_island_bbox(faces_data, idxs) for idxs in islands]
@@ -1352,6 +1376,11 @@ def _resolve_island_overlaps(
         for i in range(len(islands)):
             ax0, ay0, ax1, ay1 = bboxes[i]
             for j in range(i + 1, len(islands)):
+                # Skip pairs that were already overlapping in the original layout
+                pair_key = (i, j) if i < j else (j, i)
+                if pair_key in skip:
+                    continue
+
                 bx0, by0, bx1, by1 = bboxes[j]
 
                 # Gap-based test: conflict only if gap < pad in BOTH axes.
@@ -1423,9 +1452,13 @@ def _resolve_island_overlaps(
 
 
 #region RS-ORCH
-# Top-level resnap orchestrator: 5-step pipeline
-# (detect islands -> snap coords -> clamp -> resolve overlaps -> final clamp)
+# Top-level resnap orchestrator: 3-step pipeline
+# (detect islands -> snap coords to nearest -> clamp to bounds)
 # Returns (new_model, log_lines, detected_uv_units)
+#
+# Resnap is a PURE snap-to-nearest operation with a minimum-face-size bias.
+# It does NOT repack, rearrange, resolve overlaps, or fill blank spaces.
+# Pre-existing overlaps and touching islands are preserved exactly as-is.
 
 
 def _resnap_model_uvs(
@@ -1439,12 +1472,19 @@ def _resnap_model_uvs(
     island_pad_px: int,
     uv_units: Optional[str] = None,
 ) -> tuple[dict, list[str], str]:
-    """Re-snap existing face UVs to the target texture grid, preserving islands.
+    """Re-snap existing face UVs to the target texture grid.
+
+    This is a pure snap-to-nearest operation with a minimum-face-size bias
+    (default 1px).  It does NOT repack, rearrange, resolve overlaps, or fill
+    blank spaces.  Pre-existing overlaps and touching islands are preserved
+    exactly as-is — that is the user's responsibility, not resnap's.
 
     Faces that share edges in the original UV layout are treated as a single
     island: their shared coordinates are snapped together so the island stays
-    connected.  Overlap resolution and border padding operate on whole islands
-    (uniform translation), not individual faces.
+    connected.  Border padding clamps islands to the texture bounds.
+
+    The ``island_pad_px`` parameter is accepted for API compatibility but is
+    NOT used — resnap does not add padding between islands.
 
     Returns (new_model, log_lines, detected_uv_units).
     """
@@ -1517,44 +1557,29 @@ def _resnap_model_uvs(
     lo = max(0, int(border_pad_px))
     hi_x = int(tex_w) - lo
     hi_y = int(tex_h) - lo
-    pad = max(0, int(island_pad_px))
 
-    # Step 1: detect islands from the original (pre-snap) layout
+    # Step 1: detect islands from the original (pre-snap) layout.
+    # Islands are only used to keep shared edges snapped together — they are
+    # NOT used for overlap resolution or rearrangement.
     islands = _detect_uv_islands(faces_data)
     log.append(f"Detected {len(islands)} UV island(s) from {len(faces_data)} faces")
+    log.append("Resnap mode: pure snap-to-nearest (no repack/overlap-fix/fill)")
 
-    # Step 2: snap each island's shared coordinates to integers
+    # Step 2: snap each island's shared coordinates to nearest integers.
+    # bias_boundaries=False: round to nearest (no floor/ceil inflation).
+    # min_face_px enforces a minimum 1px face size.
     for island_indices in islands:
         _snap_island_coordinates(
             island_face_indices=island_indices,
             faces_data=faces_data,
             min_face_px=min_face_px,
             bias_gt_px=bias_gt_px,
+            bias_boundaries=False,
         )
 
-    # Step 3: clamp each island to texture bounds (translate whole island)
-    for island_indices in islands:
-        _clamp_island_to_bounds(
-            faces_data=faces_data,
-            indices=island_indices,
-            lo=lo,
-            hi_x=hi_x,
-            hi_y=hi_y,
-            tex_w=int(tex_w),
-            tex_h=int(tex_h),
-        )
-
-    # Step 4: resolve inter-island overlaps with whole-island translations
-    stable = _resolve_island_overlaps(
-        faces_data=faces_data,
-        islands=islands,
-        lo=lo,
-        hi_x=hi_x,
-        hi_y=hi_y,
-        pad=pad,
-    )
-
-    # Step 5: final clamp after nudges (preserve border padding)
+    # Step 3: clamp each island to texture bounds (translate whole island).
+    # This only moves islands that fall outside the texture after snapping —
+    # it does NOT rearrange or separate islands.
     for island_indices in islands:
         _clamp_island_to_bounds(
             faces_data=faces_data,
@@ -1583,7 +1608,7 @@ def _resnap_model_uvs(
         log.append(f"  el{fd['el']:03d} {fd['face']:<5s}: ({x0},{y0},{x1},{y1}) {x1-x0}x{y1-y0}px  disp={disp:.1f}px")
 
     log.append("")
-    log.append(f"Resnapped {len(faces_data)} faces in {len(islands)} islands.  Max displacement: {max_disp:.1f}px.  Overlap-stable: {stable}")
+    log.append(f"Resnapped {len(faces_data)} faces in {len(islands)} islands.  Max displacement: {max_disp:.1f}px.")
     return out, log, units
 #endregion
 #endregion

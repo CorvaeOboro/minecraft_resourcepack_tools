@@ -252,6 +252,122 @@ def _greedy_merge_group(
 
 
 # ---------------------------------------------------------------------------
+# Overlap reduction
+# ---------------------------------------------------------------------------
+#
+# Two cuboids that overlap share volume that is rendered twice (z-fighting /
+# wasted geometry). When box A can be trimmed to a single smaller box A' such
+# that the removed portion of A is entirely covered by box B (A \\ A' ⊆ B),
+# replacing A with A' preserves the external (union) volume exactly while
+# eliminating the A∩B overlap.
+#
+# A \\ (A∩B) is a single box iff, on exactly one axis, A extends past the
+# overlap interval on a single side, and on the other two axes A coincides
+# with the overlap (i.e. B contains A on those two axes). If A coincides with
+# the overlap on all three axes then A ⊆ B and A can be dropped entirely.
+
+def _try_trim(
+    a_fr: tuple[float, float, float],
+    a_to: tuple[float, float, float],
+    b_fr: tuple[float, float, float],
+    b_to: tuple[float, float, float],
+    eps: float,
+) -> Optional[tuple[str, Optional[tuple[tuple[float, float, float], tuple[float, float, float]]]]]:
+    """Try to trim box A so it no longer overlaps box B, preserving the union.
+
+    Returns:
+      ("remove", None)  -- A is fully inside B; A can be deleted.
+      ("trim", (fr,to)) -- A can be replaced by the single box A' = A \\ (A∩B).
+      None              -- no single-box trim preserves the union.
+    """
+    exts: list[tuple[int, str]] = []
+    for ax in range(3):
+        ov_lo = max(a_fr[ax], b_fr[ax])
+        ov_hi = min(a_to[ax], b_to[ax])
+        if ov_hi <= ov_lo + eps:
+            # no overlap on this axis -> boxes are disjoint -> nothing to trim
+            return None
+
+        lo_ext = a_fr[ax] < ov_lo - eps
+        hi_ext = a_to[ax] > ov_hi + eps
+        if lo_ext and hi_ext:
+            # A extends past the overlap on both sides -> A\\(A∩B) is two boxes
+            return None
+        if lo_ext:
+            exts.append((ax, "lo"))
+        elif hi_ext:
+            exts.append((ax, "hi"))
+
+    if len(exts) == 0:
+        # A == A∩B  ->  A ⊆ B  ->  A is redundant
+        return ("remove", None)
+    if len(exts) != 1:
+        # would need more than one box to represent A \\ (A∩B)
+        return None
+
+    ax, side = exts[0]
+    ov_lo = max(a_fr[ax], b_fr[ax])
+    ov_hi = min(a_to[ax], b_to[ax])
+    new_fr = list(a_fr)
+    new_to = list(a_to)
+    if side == "lo":
+        new_to[ax] = ov_lo  # A' = [a_lo, ov_lo] on this axis
+    else:
+        new_fr[ax] = ov_hi  # A' = [ov_hi, a_hi] on this axis
+    return ("trim", (tuple(new_fr), tuple(new_to)))
+
+
+def _total_overlap_volume(
+    boxes: list[tuple[tuple[float, float, float], tuple[float, float, float]]],
+) -> float:
+    """Sum of pairwise overlap volumes (counts each shared region per pair)."""
+    total = 0.0
+    n = len(boxes)
+    for i in range(n):
+        for j in range(i + 1, n):
+            total += _overlap_volume(boxes[i][0], boxes[i][1], boxes[j][0], boxes[j][1])
+    return total
+
+
+def _reduce_overlaps_group(
+    boxes: list[tuple[tuple[float, float, float], tuple[float, float, float]]],
+    eps: float,
+) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
+    """Greedily trim boxes against each other to remove overlapping volume.
+
+    Every trim preserves the union volume of the group by construction
+    (the trimmed-away part of A is always fully covered by the box B it was
+    trimmed against). Iterates until no further single-box trim is possible.
+    """
+    current = list(boxes)
+
+    changed = True
+    while changed:
+        changed = False
+        n = len(current)
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                res = _try_trim(current[i][0], current[i][1], current[j][0], current[j][1], eps)
+                if res is None:
+                    continue
+                kind, payload = res
+                if kind == "remove":
+                    current.pop(i)
+                else:
+                    current[i] = payload  # type: ignore[index]
+                changed = True
+                break
+            if changed:
+                break
+            # n may have shrunk; recompute for the outer loop guard
+            n = len(current)
+
+    return current
+
+
+# ---------------------------------------------------------------------------
 # Output element construction
 # ---------------------------------------------------------------------------
 
@@ -468,6 +584,7 @@ def _optimize_model(
     elements: list[Element],
     *,
     eps: float,
+    reduce_overlaps: bool = False,
 ) -> OptimizeResult:
     # Group by rotation frame
     groups: dict[Optional[tuple], dict] = {}
@@ -489,10 +606,14 @@ def _optimize_model(
     group_stats: list[GroupStats] = []
     total_input_vol = 0.0
     total_output_vol = 0.0
+    total_input_overlap = 0.0
+    total_output_overlap = 0.0
 
     log: list[str] = []
     log.append(f"Input elements: {len(elements)}")
     log.append(f"Rotation groups: {len(groups)}")
+    if reduce_overlaps:
+        log.append("Mode: overlap reduction (union volume preserved)")
     log.append("")
 
     for gi, key in enumerate(group_order):
@@ -502,11 +623,19 @@ def _optimize_model(
 
         input_vol = sum(_aabb_volume(fr, to) for fr, to in boxes)
         total_input_vol += input_vol
+        input_overlap = _total_overlap_volume(boxes)
+        total_input_overlap += input_overlap
 
-        merged = _greedy_merge_group(boxes, eps)
+        if reduce_overlaps:
+            reduced = _reduce_overlaps_group(boxes, eps)
+        else:
+            reduced = boxes
+        merged = _greedy_merge_group(reduced, eps)
 
         output_vol = sum(_aabb_volume(fr, to) for fr, to in merged)
         total_output_vol += output_vol
+        output_overlap = _total_overlap_volume(merged)
+        total_output_overlap += output_overlap
 
         for fr, to in merged:
             donor_i = _dominant_element(fr, to, group["elements"])
@@ -518,6 +647,10 @@ def _optimize_model(
             f"Group {gi} ({label}): {len(boxes)} -> {len(merged)} boxes, "
             f"volume {input_vol:.4f} -> {output_vol:.4f}"
         )
+        if reduce_overlaps:
+            log.append(
+                f"  overlap {input_overlap:.6f} -> {output_overlap:.6f}"
+            )
 
         group_stats.append(GroupStats(
             rotation_key=key,
@@ -538,6 +671,17 @@ def _optimize_model(
         log.append("Volume preserved: exact")
     else:
         log.append(f"Volume delta: {vol_delta:+.6f}")
+
+    if reduce_overlaps:
+        log.append(
+            f"Total overlap: {total_input_overlap:.6f} -> {total_output_overlap:.6f}"
+        )
+        ov_delta = total_input_overlap - total_output_overlap
+        if total_input_overlap > 1e-9:
+            ov_pct = 100.0 * ov_delta / total_input_overlap
+            log.append(f"Overlap removed: {ov_delta:.6f} ({ov_pct:.1f}%)")
+        elif abs(ov_delta) < 1e-9:
+            log.append("Overlap removed: none (no overlaps present)")
 
     reduction = len(elements) - len(out_elements)
     if len(elements) > 0:

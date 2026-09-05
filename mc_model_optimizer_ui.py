@@ -15,10 +15,6 @@ SORTGROUP::7
 SORTPRIORITY::76
 STATUS::active
 VERSION::20260316
-
-Usage
-- Simple:
-  python DEV/mc_model_greedy_optimizer_ui.py
 """
 
 from __future__ import annotations
@@ -438,6 +434,15 @@ class GreedyOptimizerMainWindow(QtWidgets.QMainWindow):
         self._btn_optimize.clicked.connect(self._on_optimize)
         self._btn_optimize.setEnabled(False)
 
+        self._btn_reduce_overlaps = QtWidgets.QPushButton("Reduce Overlaps")
+        self._btn_reduce_overlaps.setObjectName("btn_overlap")
+        self._btn_reduce_overlaps.setToolTip(
+            "Trim cuboids so overlapping intersections are removed while\n"
+            "preserving the external (union) volume, then merge adjacent boxes."
+        )
+        self._btn_reduce_overlaps.clicked.connect(self._on_reduce_overlaps)
+        self._btn_reduce_overlaps.setEnabled(False)
+
         self._btn_save = QtWidgets.QPushButton("Save Optimized JSON")
         self._btn_save.setObjectName("btn_save")
         self._btn_save.clicked.connect(self._on_save)
@@ -483,6 +488,7 @@ class GreedyOptimizerMainWindow(QtWidgets.QMainWindow):
         opt_form.setVerticalSpacing(4)
         opt_form.addRow("Merge epsilon", self._merge_eps)
         opt_form.addRow(self._btn_optimize)
+        opt_form.addRow(self._btn_reduce_overlaps)
         opt_form.addRow(self._btn_save)
 
         view_box = QtWidgets.QGroupBox("View")
@@ -633,6 +639,7 @@ class GreedyOptimizerMainWindow(QtWidgets.QMainWindow):
 
             self._txt_path.setText(str(p))
             self._btn_optimize.setEnabled(True)
+            self._btn_reduce_overlaps.setEnabled(True)
 
             self._txt_log.setPlainText(f"Loaded {len(elements)} elements from {p.name}")
             self._txt_json.setPlainText("")
@@ -643,6 +650,12 @@ class GreedyOptimizerMainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Load failed", str(e))
 
     def _on_optimize(self) -> None:
+        self._run_pass(reduce_overlaps=False)
+
+    def _on_reduce_overlaps(self) -> None:
+        self._run_pass(reduce_overlaps=True)
+
+    def _run_pass(self, *, reduce_overlaps: bool) -> None:
         if self._model is None or not self._elements:
             return
 
@@ -653,6 +666,7 @@ class GreedyOptimizerMainWindow(QtWidgets.QMainWindow):
                 model=self._model,
                 elements=self._elements,
                 eps=eps,
+                reduce_overlaps=reduce_overlaps,
             )
             self._result = result
 
@@ -675,12 +689,14 @@ class GreedyOptimizerMainWindow(QtWidgets.QMainWindow):
             self._view_mode = "optimized"
             self._btn_toggle_view.setText("Show: Optimized")
 
+            label = "Reduced overlaps" if reduce_overlaps else "Optimized"
             self._lbl_status.setText(
-                f"Optimized: {result.input_count} -> {result.output_count} elements"
+                f"{label}: {result.input_count} -> {result.output_count} elements"
             )
             self._sync_viewport_model()
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Optimize failed", str(e))
+            op = "Reduce overlaps" if reduce_overlaps else "Optimize"
+            QtWidgets.QMessageBox.critical(self, f"{op} failed", str(e))
 
     def _on_save(self) -> None:
         if self._result is None:

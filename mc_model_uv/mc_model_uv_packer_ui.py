@@ -23,7 +23,6 @@ Outputs
 - Optional per-face `rotation` (90-degree steps) when needed to keep box-net
   edges consistent.
 - 2D atlas preview showing packed islands.
-
 """
 
 #region SETUP
@@ -1123,8 +1122,14 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
 
         self._resnap_island_pad = QtWidgets.QSpinBox()
         self._resnap_island_pad.setRange(0, 256)
-        self._resnap_island_pad.setValue(1)
-        self._resnap_island_pad.setToolTip("Minimum pixel gap kept between faces during resnap overlap resolution.")
+        self._resnap_island_pad.setValue(0)
+        self._resnap_island_pad.setEnabled(False)
+        self._resnap_island_pad.setToolTip(
+            "Island padding is NOT used by resnap. Resnap is a pure "
+            "snap-to-nearest operation — it does not repack, rearrange, "
+            "resolve overlaps, or fill blank spaces. Use the Pack tab "
+            "for those operations."
+        )
 
         self._resnap_uv_units = QtWidgets.QComboBox()
         self._resnap_uv_units.addItem("Auto", userData="auto")
@@ -1159,7 +1164,7 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
         tex_form.setContentsMargins(8, 6, 8, 6)
         tex_form.setVerticalSpacing(4)
         tex_form.setHorizontalSpacing(8)
-        tex_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsFieldGrow)
+        tex_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         wh_row = QtWidgets.QHBoxLayout()
         wh_row.addWidget(QtWidgets.QLabel("W"))
