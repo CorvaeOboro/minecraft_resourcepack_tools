@@ -1,5 +1,5 @@
 """
-Minecraft Model Greedy Optimizer 
+Minecraft Model Optimizer 
 
 Pure-logic module with no PySide6 dependency. Reduces the number of cuboid
 `elements` in a Minecraft block-model by merging pairs that can be replaced
@@ -36,14 +36,88 @@ VERSION::20260316
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 
-try:
-    from mc_model_solver_ui import Cuboid, Rotation, format_minecraft_model_json
-except Exception as e:  # pragma: no cover - import guard
-    print(f"Missing dependency: mc_model_solver_ui.py ({e})")
-    raise
+# ---------------------------------------------------------------------------
+# Self-contained geometry types
+# ---------------------------------------------------------------------------
+#
+# These mirror the definitions in `mc_model_solver_ui.py` so this module can
+# run independently of that file.  Only the fields used by the optimizer
+# (fr / to / rotation) are required, but the full Cuboid API is kept for
+# parity and to avoid surprises if other code imports from here.
+
+Axis = Literal["x", "y", "z"]
+
+
+def _deg_to_rad(deg: float) -> float:
+    return deg * (math.pi / 180.0)
+
+
+def _rot_inv_xyz(*, axis: Axis, angle_deg: float, x: float, y: float, z: float) -> tuple[float, float, float]:
+    if angle_deg == 0.0:
+        return x, y, z
+
+    a = _deg_to_rad(angle_deg)
+    c = math.cos(a)
+    s = math.sin(a)
+
+    if axis == "x":
+        yy = (c * y) + (s * z)
+        zz = (-s * y) + (c * z)
+        return x, yy, zz
+
+    if axis == "y":
+        xx = (c * x) + (s * z)
+        zz = (-s * x) + (c * z)
+        return xx, y, zz
+
+    if axis == "z":
+        xx = (c * x) + (s * y)
+        yy = (-s * x) + (c * y)
+        return xx, yy, z
+
+    raise ValueError(f"Invalid axis: {axis}")
+
+
+@dataclass(frozen=True)
+class Rotation:
+    axis: Axis
+    angle: float
+    origin: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class Cuboid:
+    fr: tuple[float, float, float]
+    to: tuple[float, float, float]
+    rotation: Optional[Rotation]
+
+    def contains_point(self, p: tuple[float, float, float]) -> bool:
+        x, y, z = p
+
+        if self.rotation is not None:
+            ox, oy, oz = self.rotation.origin
+            x -= ox
+            y -= oy
+            z -= oz
+
+            x, y, z = _rot_inv_xyz(axis=self.rotation.axis, angle_deg=self.rotation.angle, x=x, y=y, z=z)
+
+            x += ox
+            y += oy
+            z += oz
+
+        fx, fy, fz = self.fr
+        tx, ty, tz = self.to
+        return (fx <= x <= tx) and (fy <= y <= ty) and (fz <= z <= tz)
+
+    def volume(self) -> float:
+        fx, fy, fz = self.fr
+        tx, ty, tz = self.to
+        return max(0.0, tx - fx) * max(0.0, ty - fy) * max(0.0, tz - fz)
 
 
 def _r6(x: float) -> float:
@@ -257,14 +331,14 @@ def _greedy_merge_group(
 #
 # Two cuboids that overlap share volume that is rendered twice (z-fighting /
 # wasted geometry). When box A can be trimmed to a single smaller box A' such
-# that the removed portion of A is entirely covered by box B (A \\ A' ⊆ B),
+# that the removed portion of A is entirely covered by box B (A \\ A' subset B),
 # replacing A with A' preserves the external (union) volume exactly while
-# eliminating the A∩B overlap.
+# eliminating the A intersect B overlap.
 #
-# A \\ (A∩B) is a single box iff, on exactly one axis, A extends past the
+# A \\ (A intersect B) is a single box iff, on exactly one axis, A extends past the
 # overlap interval on a single side, and on the other two axes A coincides
 # with the overlap (i.e. B contains A on those two axes). If A coincides with
-# the overlap on all three axes then A ⊆ B and A can be dropped entirely.
+# the overlap on all three axes then A subset B and A can be dropped entirely.
 
 def _try_trim(
     a_fr: tuple[float, float, float],
@@ -277,7 +351,7 @@ def _try_trim(
 
     Returns:
       ("remove", None)  -- A is fully inside B; A can be deleted.
-      ("trim", (fr,to)) -- A can be replaced by the single box A' = A \\ (A∩B).
+      ("trim", (fr,to)) -- A can be replaced by the single box A' = A \\ (A intersect B).
       None              -- no single-box trim preserves the union.
     """
     exts: list[tuple[int, str]] = []
@@ -291,7 +365,7 @@ def _try_trim(
         lo_ext = a_fr[ax] < ov_lo - eps
         hi_ext = a_to[ax] > ov_hi + eps
         if lo_ext and hi_ext:
-            # A extends past the overlap on both sides -> A\\(A∩B) is two boxes
+            # A extends past the overlap on both sides -> A\\(A intersect B) is two boxes
             return None
         if lo_ext:
             exts.append((ax, "lo"))
@@ -299,10 +373,10 @@ def _try_trim(
             exts.append((ax, "hi"))
 
     if len(exts) == 0:
-        # A == A∩B  ->  A ⊆ B  ->  A is redundant
+        # A == A intersect B  ->  A subset B  ->  A is redundant
         return ("remove", None)
     if len(exts) != 1:
-        # would need more than one box to represent A \\ (A∩B)
+        # would need more than one box to represent A \\ (A intersect B)
         return None
 
     ax, side = exts[0]

@@ -1477,14 +1477,14 @@ def _resnap_model_uvs(
     This is a pure snap-to-nearest operation with a minimum-face-size bias
     (default 1px).  It does NOT repack, rearrange, resolve overlaps, or fill
     blank spaces.  Pre-existing overlaps and touching islands are preserved
-    exactly as-is — that is the user's responsibility, not resnap's.
+    exactly as-is - that is the user's responsibility, not resnap's.
 
     Faces that share edges in the original UV layout are treated as a single
     island: their shared coordinates are snapped together so the island stays
     connected.  Border padding clamps islands to the texture bounds.
 
     The ``island_pad_px`` parameter is accepted for API compatibility but is
-    NOT used — resnap does not add padding between islands.
+    NOT used - resnap does not add padding between islands.
 
     Returns (new_model, log_lines, detected_uv_units).
     """
@@ -1559,7 +1559,7 @@ def _resnap_model_uvs(
     hi_y = int(tex_h) - lo
 
     # Step 1: detect islands from the original (pre-snap) layout.
-    # Islands are only used to keep shared edges snapped together — they are
+    # Islands are only used to keep shared edges snapped together - they are
     # NOT used for overlap resolution or rearrangement.
     islands = _detect_uv_islands(faces_data)
     log.append(f"Detected {len(islands)} UV island(s) from {len(faces_data)} faces")
@@ -1578,7 +1578,7 @@ def _resnap_model_uvs(
         )
 
     # Step 3: clamp each island to texture bounds (translate whole island).
-    # This only moves islands that fall outside the texture after snapping —
+    # This only moves islands that fall outside the texture after snapping -
     # it does NOT rearrange or separate islands.
     for island_indices in islands:
         _clamp_island_to_bounds(

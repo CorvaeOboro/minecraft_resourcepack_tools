@@ -1,7 +1,7 @@
 """
-Minecraft Model Greedy Optimizer (UI)
+Minecraft Model Optimizer (UI)
 
-PySide6 UI wrapper around `mc_model_greedy_optimizer_core.py`.
+PySide6 UI wrapper around `mc_model_optimizer_core.py`.
 
 Load an existing Minecraft block-model `.json` and reduce the number of
 `elements` (cuboids) by merging pairs that can be replaced by a single cuboid,
@@ -25,13 +25,8 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional
 
-try:
-    from mc_model_solver_ui import Cuboid, _apply_dark_theme
-except Exception as e:  # pragma: no cover - import guard
-    print(f"Missing dependency: mc_model_solver_ui.py ({e})")
-    raise
-
 from mc_model_optimizer_core import (
+    Cuboid,
     Element,
     OptimizeResult,
     _optimize_model,
@@ -41,6 +36,42 @@ from mc_model_optimizer_core import (
 
 import PySide6  # noqa: F401  (ensure import error surfaces clearly)
 from PySide6 import QtCore, QtGui, QtWidgets
+
+
+# ---------------------------------------------------------------------------
+# Self-contained dark theme (mirrors mc_model_solver_ui._apply_dark_theme)
+# ---------------------------------------------------------------------------
+
+def _apply_dark_theme(app: QtWidgets.QApplication) -> None:
+    app.setStyle("Fusion")
+    app.setStyleSheet(
+        "QWidget { background: #0b0b0d; color: #e8e8ea; font-size: 12px; }"
+        "QLabel { color: #e8e8ea; }"
+        "QGroupBox { border: 1px solid #1f2024; margin-top: 8px; }"
+        "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px 0 4px; color: #cfcfd4; }"
+        "QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: #000000; color: #ffffff; border: 1px solid #2a2b30; padding: 4px; border-radius: 4px; }"
+        "QPlainTextEdit, QTextEdit { background: #000000; color: #ffffff; border: 1px solid #2a2b30; padding: 6px; border-radius: 4px; }"
+        "QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 1px solid #3a6ea5; }"
+        "QComboBox QAbstractItemView { background: #000000; color: #ffffff; selection-background-color: #2b4a6b; }"
+        "QCheckBox { spacing: 6px; }"
+        "QCheckBox::indicator { width: 14px; height: 14px; }"
+        "QPushButton { background: #15161a; color: #e8e8ea; border: 1px solid #2a2b30; padding: 6px 10px; border-radius: 6px; }"
+        "QPushButton:hover { border: 1px solid #3a3b42; }"
+        "QPushButton:disabled { color: #777780; border: 1px solid #1a1b1f; background: #101114; }"
+        "QPushButton#btn_solve { background: #1b3326; border: 1px solid #2d5b3f; }"
+        "QPushButton#btn_solve:hover { border: 1px solid #3d7a55; }"
+        "QPushButton#btn_reseed { background: #1a2838; border: 1px solid #2d4664; }"
+        "QPushButton#btn_reseed:hover { border: 1px solid #3a5f86; }"
+        "QPushButton#btn_clear { background: #241a2c; border: 1px solid #4a2c63; }"
+        "QPushButton#btn_clear:hover { border: 1px solid #6a3b90; }"
+        "QPushButton#btn_save { background: #241a2c; border: 1px solid #4a2c63; }"
+        "QPushButton#btn_save:hover { border: 1px solid #6a3b90; }"
+        "QPushButton#btn_overlap { background: #2a2418; border: 1px solid #6b552d; }"
+        "QPushButton#btn_overlap:hover { border: 1px solid #8a6f3d; }"
+        "QPushButton#btn_toggle { background: #1a2838; border: 1px solid #2d4664; }"
+        "QPushButton#btn_toggle:hover { border: 1px solid #3a5f86; }"
+        "QSplitter::handle { background: #0b0b0d; }"
+    )
 
 
 class ColorizeViewport(QtWidgets.QWidget):
@@ -378,10 +409,10 @@ _PRIO_UNTOUCHED = 1
 _PRIO_NEW = 2
 
 
-class GreedyOptimizerMainWindow(QtWidgets.QMainWindow):
+class ModelOptimizerMainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Minecraft Model Greedy Optimizer")
+        self.setWindowTitle("Minecraft Model Optimizer")
 
         self._source_path: Optional[Path] = None
         self._model: Optional[dict] = None
@@ -725,7 +756,7 @@ class GreedyOptimizerMainWindow(QtWidgets.QMainWindow):
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
     _apply_dark_theme(app)
-    w = GreedyOptimizerMainWindow()
+    w = ModelOptimizerMainWindow()
     w.resize(1280, 800)
     w.show()
     sys.exit(app.exec())

@@ -24,7 +24,7 @@ Key features
   - Offsets wrap/tile, so the animation loops cleanly frame N -> frame 0.
 - Settings persistence
   - Each successful generation writes a timestamped settings JSON next to the output PNG.
-  - The latest settings are also written to mc_make_vertical_spritesheet_loop_settings.json next to this script.
+  - The latest settings are also written to mc_texture_animated_spritesheet_loop_settings.json next to this script.
   - GUI auto-loads that last-used settings file on startup.
 
 GUI usage
@@ -67,7 +67,7 @@ from typing import Optional
 
 
 def _script_settings_path() -> Path:
-    return Path(__file__).with_name("mc_make_vertical_spritesheet_loop_settings.json")
+    return Path(__file__).with_name("mc_texture_animated_spritesheet_loop_settings.json")
 
 
 def _timestamp_suffix() -> str:

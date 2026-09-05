@@ -1126,7 +1126,7 @@ class UVPackerMainWindow(QtWidgets.QMainWindow):
         self._resnap_island_pad.setEnabled(False)
         self._resnap_island_pad.setToolTip(
             "Island padding is NOT used by resnap. Resnap is a pure "
-            "snap-to-nearest operation — it does not repack, rearrange, "
+            "snap-to-nearest operation - it does not repack, rearrange, "
             "resolve overlaps, or fill blank spaces. Use the Pack tab "
             "for those operations."
         )
