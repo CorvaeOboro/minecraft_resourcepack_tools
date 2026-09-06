@@ -1,9 +1,18 @@
+"""Double-helix section generator for procedural Minecraft models.
+
+Generates two intertwined helical strands as a list of Cuboid elements,
+with optional chord-aligned rotation, auto-merge of collinear segments,
+and a 4-way radial arrangement mode. This module is headless (no PySide6
+dependency).
+"""
+
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 from typing import Optional
 
+# region IMPORTS
 from mc_model_procedural_gen_common import (
     Plane,
     _apply_depth_stagger,
@@ -19,12 +28,14 @@ from mc_model_procedural_gen_common import (
 )
 
 try:
-    from mc_model_solver_ui import Cuboid, Rotation
-except Exception as e:
-    print(f"Missing dependency: mc_model_solver_ui.py ({e})")
+    from mc_model_solver_core import Cuboid, Rotation
+except Exception as exc:
+    print(f"Missing dependency: mc_model_solver_core.py ({exc})")
     raise
+# endregion
 
 
+# region DATA
 @dataclass(frozen=True)
 class HelixSectionConfig:
     center: tuple[float, float, float]
@@ -95,8 +106,10 @@ HELIX_UI_SPECS: dict[str, dict] = {
     "target_chord_len": {"type": "double", "min": 0.0, "max": 256.0, "value": 0.75, "decimals": 3},
     "merge_max_dev": {"type": "double", "min": 0.0, "max": 64.0, "value": 0.15, "decimals": 3},
 }
+# endregion
 
 
+# region RADIAL
 def generate_radial_arrangement_4_helix(
     cfg: HelixSectionConfig,
     *,
@@ -109,18 +122,18 @@ def generate_radial_arrangement_4_helix(
     base_center = (float(cfg.center[0]), float(cfg.center[1]), float(cfg.center[2]))
     out: list[Cuboid] = []
 
-    r = float(radius)
+    radius_val = float(radius)
     positions: list[tuple[float, float, float]] = [
-        (r, 0.0, 0.0),
-        (0.0, 0.0, r),
-        (-r, 0.0, 0.0),
-        (0.0, 0.0, -r),
+        (radius_val, 0.0, 0.0),
+        (0.0, 0.0, radius_val),
+        (-radius_val, 0.0, 0.0),
+        (0.0, 0.0, -radius_val),
     ]
 
-    for k in range(4):
-        phase_rad = math.radians(float(phase_offsets_deg[k]))
-        plane_k = str(planes[k])
-        heading_k = float(cfg.heading_deg) + float(heading_offsets_deg[k])
+    for side_idx in range(4):
+        phase_rad = math.radians(float(phase_offsets_deg[side_idx]))
+        plane_k = str(planes[side_idx])
+        heading_k = float(cfg.heading_deg) + float(heading_offsets_deg[side_idx])
 
         cfg2 = HelixSectionConfig(
             center=base_center,
@@ -153,41 +166,43 @@ def generate_radial_arrangement_4_helix(
         els = generate_double_helix_section(cfg2, phase_offset_rad=phase_rad)
         els = _apply_depth_stagger(list(els), plane=str(plane_k), step=float(depth_stagger_step))
 
-        delta = positions[int(k)]
-        for c in list(els):
-            cc = _transform_cuboid_global(c, scale=1.0, offset=delta)
-            if cc is not None:
-                out.append(cc)
+        delta = positions[int(side_idx)]
+        for cub in list(els):
+            cub_xf = _transform_cuboid_global(cub, scale=1.0, offset=delta)
+            if cub_xf is not None:
+                out.append(cub_xf)
 
     return out
 
 
+# endregion
+# region GENERATE
 def generate_double_helix_section(cfg: HelixSectionConfig, *, phase_offset_rad: float = 0.0) -> list[Cuboid]:
     segs = max(1, int(cfg.segments))
 
     plane_raw = str(cfg.axis_plane)
-    parts = [p.strip() for p in plane_raw.split(":") if p.strip()]
+    parts = [part.strip() for part in plane_raw.split(":") if part.strip()]
     plane = str(parts[0] if len(parts) > 0 else "XZ")
     if plane not in ("XZ", "XY", "YZ"):
         plane = "XZ"
-    mirror = bool(any(p.lower() == "mirror" for p in parts[1:]))
+    mirror = bool(any(part.lower() == "mirror" for part in parts[1:]))
     handed = -1.0 if mirror else 1.0
 
     rot_offset = float(cfg.chord_align_rotation_offset_deg)
 
-    def _rot_axis_for_plane(p: str) -> str:
-        if p == "XZ":
+    def _rot_axis_for_plane(plane_str: str) -> str:
+        if plane_str == "XZ":
             return "y"
-        if p == "XY":
+        if plane_str == "XY":
             return "z"
         return "x"
 
     def _rot_from_delta_axis(dx: float, dy: float, dz: float, *, axis: str) -> tuple[bool, float]:
-        a = str(axis)
-        if a == "y":
+        axis_str = str(axis)
+        if axis_str == "y":
             dir_deg = _canonical_direction_deg(math.degrees(math.atan2(float(dz), float(dx))))
             return _reduce_to_limited_rotation(-float(dir_deg) + float(rot_offset))
-        if a == "z":
+        if axis_str == "z":
             dir_deg = _canonical_direction_deg(math.degrees(math.atan2(float(dy), float(dx))))
             return _reduce_to_limited_rotation(float(dir_deg) + float(rot_offset))
         dir_deg = _canonical_direction_deg(math.degrees(math.atan2(float(dz), float(dy))))
@@ -199,10 +214,10 @@ def generate_double_helix_section(cfg: HelixSectionConfig, *, phase_offset_rad: 
         thick = max(0.01, float(thick))
         tlen = max(0.01, float(tlen))
 
-        ra = str(rot_axis).strip().lower()
-        if ra == "y":
+        rot_axis_str = str(rot_axis).strip().lower()
+        if rot_axis_str == "y":
             sx, sy, sz = (width, thick, tlen) if swap else (tlen, thick, width)
-        elif ra == "z":
+        elif rot_axis_str == "z":
             sx, sy, sz = (width, tlen, thick) if swap else (tlen, width, thick)
         else:
             sx, sy, sz = (thick, width, tlen) if swap else (thick, tlen, width)
@@ -265,14 +280,14 @@ def generate_double_helix_section(cfg: HelixSectionConfig, *, phase_offset_rad: 
 
     out: list[Cuboid] = []
 
-    def point_at(t: float, a: float) -> tuple[float, float, float]:
-        along = (float(t) * length) - (length * 0.5)
+    def point_at(t_param: float, angle_rad: float) -> tuple[float, float, float]:
+        along = (float(t_param) * length) - (length * 0.5)
         ox = float(axis_dir[0]) * along
         oy = float(axis_dir[1]) * along
         oz = float(axis_dir[2]) * along
-        rx = (float(basis1[0]) * math.cos(a) + float(basis2[0]) * math.sin(a)) * radius
-        ry = (float(basis1[1]) * math.cos(a) + float(basis2[1]) * math.sin(a)) * radius
-        rz = (float(basis1[2]) * math.cos(a) + float(basis2[2]) * math.sin(a)) * radius
+        rx = (float(basis1[0]) * math.cos(angle_rad) + float(basis2[0]) * math.sin(angle_rad)) * radius
+        ry = (float(basis1[1]) * math.cos(angle_rad) + float(basis2[1]) * math.sin(angle_rad)) * radius
+        rz = (float(basis1[2]) * math.cos(angle_rad) + float(basis2[2]) * math.sin(angle_rad)) * radius
         dx = float(ox + rx)
         dy = float(oy + ry)
         dz = float(oz + rz)
@@ -284,22 +299,22 @@ def generate_double_helix_section(cfg: HelixSectionConfig, *, phase_offset_rad: 
     use_chord = bool(cfg.chord_align_rotation)
     axis_only = bool(cfg.chord_axis_only)
 
-    def to_plane(v: tuple[float, float, float]) -> tuple[float, float]:
+    def to_plane(pt: tuple[float, float, float]) -> tuple[float, float]:
         if rot_plane == "XZ":
-            return (float(v[0]), float(v[2]))
+            return (float(pt[0]), float(pt[2]))
         if rot_plane == "XY":
-            return (float(v[0]), float(v[1]))
-        return (float(v[1]), float(v[2]))
+            return (float(pt[0]), float(pt[1]))
+        return (float(pt[1]), float(pt[2]))
 
-    def seg_len_plane(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
-        ax, ay = to_plane(a)
-        bx, by = to_plane(b)
+    def seg_len_plane(pt_a: tuple[float, float, float], pt_b: tuple[float, float, float]) -> float:
+        ax, ay = to_plane(pt_a)
+        bx, by = to_plane(pt_b)
         return math.hypot(float(bx - ax), float(by - ay))
 
-    def point_seg_dist_plane(p: tuple[float, float, float], a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
-        px, py = to_plane(p)
-        ax, ay = to_plane(a)
-        bx, by = to_plane(b)
+    def point_seg_dist_plane(pt: tuple[float, float, float], pt_a: tuple[float, float, float], pt_b: tuple[float, float, float]) -> float:
+        px, py = to_plane(pt)
+        ax, ay = to_plane(pt_a)
+        bx, by = to_plane(pt_b)
         abx = float(bx - ax)
         aby = float(by - ay)
         apx = float(px - ax)
@@ -307,42 +322,42 @@ def generate_double_helix_section(cfg: HelixSectionConfig, *, phase_offset_rad: 
         denom = (abx * abx) + (aby * aby)
         if denom <= 1e-12:
             return math.hypot(float(px - ax), float(py - ay))
-        t = (apx * abx + apy * aby) / denom
-        t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else float(t)
-        cx2 = float(ax) + abx * t
-        cy2 = float(ay) + aby * t
+        t_proj = (apx * abx + apy * aby) / denom
+        t_proj = 0.0 if t_proj < 0.0 else 1.0 if t_proj > 1.0 else float(t_proj)
+        cx2 = float(ax) + abx * t_proj
+        cy2 = float(ay) + aby * t_proj
         return math.hypot(float(px - cx2), float(py - cy2))
 
-    def strand_point(t: float, *, strand_phase: float) -> tuple[float, float, float]:
-        a = (2.0 * math.pi) * turns * float(t) * float(handed) + phase0 + float(strand_phase)
-        return point_at(float(t), float(a))
+    def strand_point(t_param: float, *, strand_phase: float) -> tuple[float, float, float]:
+        angle_rad = (2.0 * math.pi) * turns * float(t_param) * float(handed) + phase0 + float(strand_phase)
+        return point_at(float(t_param), float(angle_rad))
 
-    def axis_component_len(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
-        dx = float(b[0] - a[0])
-        dy = float(b[1] - a[1])
-        dz = float(b[2] - a[2])
+    def axis_component_len(pt_a: tuple[float, float, float], pt_b: tuple[float, float, float]) -> float:
+        dx = float(pt_b[0] - pt_a[0])
+        dy = float(pt_b[1] - pt_a[1])
+        dz = float(pt_b[2] - pt_a[2])
         adx = float(axis_dir[0]) * scx
         ady = float(axis_dir[1]) * scy
         adz = float(axis_dir[2]) * scz
-        n = math.sqrt(adx * adx + ady * ady + adz * adz)
-        if n <= 1e-12:
-            da = float(dx) * float(axis_dir[0]) + float(dy) * float(axis_dir[1]) + float(dz) * float(axis_dir[2])
-            return abs(float(da))
-        ux = adx / n
-        uy = ady / n
-        uz = adz / n
-        da = float(dx) * ux + float(dy) * uy + float(dz) * uz
-        return abs(float(da))
+        norm = math.sqrt(adx * adx + ady * ady + adz * adz)
+        if norm <= 1e-12:
+            dot_val = float(dx) * float(axis_dir[0]) + float(dy) * float(axis_dir[1]) + float(dz) * float(axis_dir[2])
+            return abs(float(dot_val))
+        ux = adx / norm
+        uy = ady / norm
+        uz = adz / norm
+        dot_val = float(dx) * ux + float(dy) * uy + float(dz) * uz
+        return abs(float(dot_val))
 
     if not use_chord:
         for i in range(segs):
             t0 = 0.0 if segs <= 1 else float(i) / float(segs - 1)
             a0 = (2.0 * math.pi) * turns * float(t0) + phase0
-            p1 = point_at(t0, a0)
-            p2 = point_at(t0, a0 + math.pi)
+            pt1 = point_at(t0, a0)
+            pt2 = point_at(t0, a0 + math.pi)
 
-            el1 = build_element(
-                center=p1,
+            elem1 = build_element(
+                center=pt1,
                 width=float(cfg.strand_width),
                 thick=float(cfg.strand_depth),
                 tlen=float(cfg.segment_len),
@@ -350,11 +365,11 @@ def generate_double_helix_section(cfg: HelixSectionConfig, *, phase_offset_rad: 
                 rot_angle=float(rot_angle_fixed),
                 swap=bool(swap_fixed),
             )
-            if el1 is not None:
-                out.append(el1)
+            if elem1 is not None:
+                out.append(elem1)
 
-            el2 = build_element(
-                center=p2,
+            elem2 = build_element(
+                center=pt2,
                 width=float(cfg.strand_width),
                 thick=float(cfg.strand_depth),
                 tlen=float(cfg.segment_len),
@@ -362,8 +377,8 @@ def generate_double_helix_section(cfg: HelixSectionConfig, *, phase_offset_rad: 
                 rot_angle=float(rot_angle_fixed),
                 swap=bool(swap_fixed),
             )
-            if el2 is not None:
-                out.append(el2)
+            if elem2 is not None:
+                out.append(elem2)
 
         if bool(cfg.greedy_merge):
             out = _greedy_merge_aligned_adjacent(list(out), origin_step=float(cfg.snap_step))
@@ -379,15 +394,15 @@ def generate_double_helix_section(cfg: HelixSectionConfig, *, phase_offset_rad: 
     if target_len > 0.0:
         refined: list[float] = [float(t_breaks[0])]
         for i in range(len(t_breaks) - 1):
-            ta = float(t_breaks[i])
-            tb = float(t_breaks[i + 1])
-            pa = strand_point(ta, strand_phase=0.0)
-            pb = strand_point(tb, strand_phase=0.0)
-            L = axis_component_len(pa, pb) if axis_only else seg_len_plane(pa, pb)
-            n = int(max(1.0, math.ceil(float(L) / float(target_len))))
-            n = int(min(128, n))
-            for k in range(1, n + 1):
-                refined.append(ta + (tb - ta) * (float(k) / float(n)))
+            t_start = float(t_breaks[i])
+            t_end = float(t_breaks[i + 1])
+            pt_a = strand_point(t_start, strand_phase=0.0)
+            pt_b = strand_point(t_end, strand_phase=0.0)
+            chord_len = axis_component_len(pt_a, pt_b) if axis_only else seg_len_plane(pt_a, pt_b)
+            sub_count = int(max(1.0, math.ceil(float(chord_len) / float(target_len))))
+            sub_count = int(min(128, sub_count))
+            for sub_idx in range(1, sub_count + 1):
+                refined.append(t_start + (t_end - t_start) * (float(sub_idx) / float(sub_count)))
         t_breaks = refined
 
     max_len = float(cfg.max_merge_len)
@@ -414,7 +429,7 @@ def generate_double_helix_section(cfg: HelixSectionConfig, *, phase_offset_rad: 
                 return
             center = ((group_start[0] + group_end[0]) * 0.5, (group_start[1] + group_end[1]) * 0.5, (group_start[2] + group_end[2]) * 0.5)
             tlen2 = axis_component_len(group_start, group_end) if axis_only else seg_len_plane(group_start, group_end)
-            el = build_element(
+            elem = build_element(
                 center=center,
                 width=float(cfg.strand_width),
                 thick=float(cfg.strand_depth),
@@ -423,19 +438,19 @@ def generate_double_helix_section(cfg: HelixSectionConfig, *, phase_offset_rad: 
                 rot_angle=float(group_rot_angle),
                 swap=bool(group_swap),
             )
-            if el is not None:
-                strand_out.append(el)
+            if elem is not None:
+                strand_out.append(elem)
             group_start = None
             group_end = None
 
         for i in range(len(t_breaks) - 1):
             t0 = float(t_breaks[i])
             t1 = float(t_breaks[i + 1])
-            p0 = strand_point(t0, strand_phase=float(strand_phase))
-            p1 = strand_point(t1, strand_phase=float(strand_phase))
-            dx = float(p1[0] - p0[0])
-            dy = float(p1[1] - p0[1])
-            dz = float(p1[2] - p0[2])
+            pt0 = strand_point(t0, strand_phase=float(strand_phase))
+            pt1 = strand_point(t1, strand_phase=float(strand_phase))
+            dx = float(pt1[0] - pt0[0])
+            dy = float(pt1[1] - pt0[1])
+            dz = float(pt1[2] - pt0[2])
 
             if axis_only:
                 swap = bool(swap_fixed)
@@ -452,26 +467,26 @@ def generate_double_helix_section(cfg: HelixSectionConfig, *, phase_offset_rad: 
                     can_merge = False
 
             if can_merge and (not axis_only) and merge_max_dev > 0.0:
-                tm2 = (float(group_t0) + float(t1)) * 0.5
-                pm = strand_point(tm2, strand_phase=float(strand_phase))
-                if point_seg_dist_plane(pm, group_start, p1) > float(merge_max_dev):
+                t_mid = (float(group_t0) + float(t1)) * 0.5
+                pt_mid = strand_point(t_mid, strand_phase=float(strand_phase))
+                if point_seg_dist_plane(pt_mid, group_start, pt1) > float(merge_max_dev):
                     can_merge = False
 
             if can_merge and max_len > 0.0:
-                Lm = axis_component_len(group_start, p1) if axis_only else seg_len_plane(group_start, p1)
-                if float(Lm) > float(max_len):
+                chord_len_merge = axis_component_len(group_start, pt1) if axis_only else seg_len_plane(group_start, pt1)
+                if float(chord_len_merge) > float(max_len):
                     can_merge = False
 
             if not can_merge:
                 flush_group()
-                group_start = (float(p0[0]), float(p0[1]), float(p0[2]))
-                group_end = (float(p1[0]), float(p1[1]), float(p1[2]))
+                group_start = (float(pt0[0]), float(pt0[1]), float(pt0[2]))
+                group_end = (float(pt1[0]), float(pt1[1]), float(pt1[2]))
                 group_t0 = float(t0)
                 group_t1 = float(t1)
                 group_rot_angle = float(rot_angle)
                 group_swap = bool(swap)
             else:
-                group_end = (float(p1[0]), float(p1[1]), float(p1[2]))
+                group_end = (float(pt1[0]), float(pt1[1]), float(pt1[2]))
                 group_t1 = float(t1)
 
         flush_group()
@@ -484,10 +499,11 @@ def generate_double_helix_section(cfg: HelixSectionConfig, *, phase_offset_rad: 
     strand_b = build_strand(strand_phase=math.pi)
 
     out = []
-    nmax = max(len(strand_a), len(strand_b))
-    for i in range(nmax):
+    max_count = max(len(strand_a), len(strand_b))
+    for i in range(max_count):
         if i < len(strand_a):
             out.append(strand_a[i])
         if i < len(strand_b):
             out.append(strand_b[i])
     return out
+# endregion

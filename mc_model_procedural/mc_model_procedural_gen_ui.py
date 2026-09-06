@@ -56,7 +56,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# Bootstrap sys.path so the tool can be launched from any working directory.
+_THIS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _THIS_DIR.parent
+for _subdir in (_THIS_DIR, _REPO_ROOT / "mc_model_solver"):
+    _path_str = str(_subdir)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
 
+# region IMPORTS
 def _try_import_pyside6():
     try:
         from PySide6 import QtCore, QtGui, QtWidgets
@@ -75,10 +83,15 @@ if _imports is None:
 QtCore, QtGui, QtWidgets = _imports
 
 try:
+    from mc_model_solver_core import Cuboid, Rotation
+except Exception as exc:
+    print(f"Missing dependency: mc_model_solver_core.py ({exc})")
+    raise SystemExit(1)
+
+try:
     from mc_model_solver_ui import ModelViewport, format_minecraft_model_json, _apply_dark_theme
-    from mc_model_solver_ui import Cuboid, Rotation
-except Exception as e:
-    print(f"Missing dependency: mc_model_solver_ui.py ({e})")
+except Exception as exc:
+    print(f"Missing dependency: mc_model_solver_ui.py ({exc})")
     raise SystemExit(1)
 
 from mc_model_procedural_gen_common import (
@@ -93,7 +106,9 @@ from mc_model_procedural_gen_common import (
 )
 from mc_model_procedural_gen_shape_helix import HELIX_UI_SPECS, HelixSectionConfig, generate_double_helix_section, generate_radial_arrangement_4_helix
 from mc_model_procedural_gen_shape_spiral import SPIRAL_UI_SPECS, SpiralConfig, generate_radial_arrangement_4, generate_shape
+# endregion
 
+# region HELPERS
 _INSTANCE_SETTINGS_JSON_TYPE = "mc_procedural_instance_settings"
 _INSTANCE_SETTINGS_JSON_VERSION = 1
 
@@ -124,33 +139,33 @@ def _build_widget_from_spec(spec: dict) -> QtWidgets.QWidget:
         raise ValueError("UI spec must be a dict")
     typ = str(spec.get("type", ""))
     if typ == "combo":
-        w = QtWidgets.QComboBox()
+        widget = QtWidgets.QComboBox()
         items = spec.get("items", [])
         if isinstance(items, list):
             for it in list(items):
                 if isinstance(it, (tuple, list)) and len(it) == 2:
-                    w.addItem(str(it[0]), userData=str(it[1]))
+                    widget.addItem(str(it[0]), userData=str(it[1]))
         cur = int(spec.get("current", 0))
-        if w.count() > 0:
-            cur = 0 if cur < 0 else (w.count() - 1) if cur >= w.count() else cur
-            w.setCurrentIndex(int(cur))
-        return w
+        if widget.count() > 0:
+            cur = 0 if cur < 0 else (widget.count() - 1) if cur >= widget.count() else cur
+            widget.setCurrentIndex(int(cur))
+        return widget
     if typ == "spin":
-        w = QtWidgets.QSpinBox()
-        w.setRange(int(spec.get("min", 0)), int(spec.get("max", 999999)))
-        w.setValue(int(spec.get("value", 0)))
-        return w
+        widget = QtWidgets.QSpinBox()
+        widget.setRange(int(spec.get("min", 0)), int(spec.get("max", 999999)))
+        widget.setValue(int(spec.get("value", 0)))
+        return widget
     if typ == "double":
-        w = QtWidgets.QDoubleSpinBox()
-        w.setRange(float(spec.get("min", -1e9)), float(spec.get("max", 1e9)))
-        w.setValue(float(spec.get("value", 0.0)))
+        widget = QtWidgets.QDoubleSpinBox()
+        widget.setRange(float(spec.get("min", -1e9)), float(spec.get("max", 1e9)))
+        widget.setValue(float(spec.get("value", 0.0)))
         if "decimals" in spec:
-            w.setDecimals(int(spec.get("decimals", 3)))
-        return w
+            widget.setDecimals(int(spec.get("decimals", 3)))
+        return widget
     if typ == "check":
-        w = QtWidgets.QCheckBox(str(spec.get("text", "")))
-        w.setChecked(bool(spec.get("checked", False)))
-        return w
+        widget = QtWidgets.QCheckBox(str(spec.get("text", "")))
+        widget.setChecked(bool(spec.get("checked", False)))
+        return widget
     raise ValueError(f"Unknown UI spec type: {typ}")
 
 
@@ -160,13 +175,13 @@ _UI_LAYOUT_SPACING = 4
 
 
 def _apply_button_scheme(btn: QtWidgets.QPushButton, scheme: str) -> None:
-    s = str(scheme)
-    if s == "green":
+    scheme_str = str(scheme)
+    if scheme_str == "green":
         bg = "#3f6d55"
         bg_h = "#4a7b60"
         bg_p = "#365f4a"
         bd = "#2f4f3e"
-    elif s == "blue":
+    elif scheme_str == "blue":
         bg = "#3a5f78"
         bg_h = "#436c88"
         bg_p = "#315165"
@@ -210,12 +225,14 @@ def _parse_vec3_relaxed(text: str) -> tuple[float, float, float]:
         raw = raw[1:-1].strip()
     try:
         return _parse_vec3_str(raw)
-    except Exception:
-        parts = [p for p in raw.replace("\t", " ").split(" ") if p.strip()]
+    except ValueError:
+        parts = [part for part in raw.replace("\t", " ").split(" ") if part.strip()]
         if len(parts) == 3:
             return (float(parts[0]), float(parts[1]), float(parts[2]))
         raise
 
+# endregion
+# region GEN
 def _generate_elements_from_settings_dict(settings: dict) -> tuple[list[Cuboid], float]:
     if not isinstance(settings, dict):
         raise ValueError("Settings JSON must be an object")
@@ -299,13 +316,13 @@ def _generate_elements_from_settings_dict(settings: dict) -> tuple[list[Cuboid],
     s = float(settings.get("post_scale", 1.0))
     min_vol = float(settings.get("min_volume", 0.0))
     post: list[Cuboid] = []
-    for c in list(base_raw):
-        cc = _scale_cuboid_about_centroid(c, s, origin_step=float(snap_step))
-        if cc is None:
+    for cub in list(base_raw):
+        cub_xf = _scale_cuboid_about_centroid(cub, s, origin_step=float(snap_step))
+        if cub_xf is None:
             continue
-        if min_vol > 0.0 and _cuboid_volume(cc) < min_vol:
+        if min_vol > 0.0 and _cuboid_volume(cub_xf) < min_vol:
             continue
-        post.append(cc)
+        post.append(cub_xf)
 
     post = _apply_depth_stagger(list(post), plane=str(depth_plane), step=float(settings.get("depth_stagger_step", 0.0)))
     return post, float(snap_step)
@@ -352,6 +369,8 @@ def _load_elements_from_model_json_file(path: Path) -> list[Cuboid]:
     return _elements_from_minecraft_model_json(model)
 
 
+# endregion
+# region WINDOW
 class ProceduralShapesMainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -410,6 +429,13 @@ class ProceduralShapesMainWindow(QtWidgets.QMainWindow):
         self._arr_instances_prev_row = -1
         self._inst_editor_updating = False
         self._init_instances_model()
+
+    def closeEvent(self, event) -> None:
+        if hasattr(self, "_orig_stdout") and self._orig_stdout is not None:
+            sys.stdout = self._orig_stdout
+        if hasattr(self, "_orig_stderr") and self._orig_stderr is not None:
+            sys.stderr = self._orig_stderr
+        super().closeEvent(event)
 
     def _default_instance_settings_filename(self, idx: int) -> str:
         i = int(idx)
@@ -711,8 +737,8 @@ class ProceduralShapesMainWindow(QtWidgets.QMainWindow):
         self._viewport.set_cuboids(show_elements)
 
         lines: list[str] = []
-        for i, c in enumerate(show_elements):
-            lines.append(f"{i:03d} from=({c.fr[0]:g},{c.fr[1]:g},{c.fr[2]:g}) to=({c.to[0]:g},{c.to[1]:g},{c.to[2]:g})")
+        for i, cub in enumerate(show_elements):
+            lines.append(f"{i:03d} from=({cub.fr[0]:g},{cub.fr[1]:g},{cub.fr[2]:g}) to=({cub.to[0]:g},{cub.to[1]:g},{cub.to[2]:g})")
         self._txt_elements.setPlainText("\n".join(lines))
 
         show_model = self._current_model_arr if show_arr and self._current_model_arr is not None else self._current_model_base
@@ -755,10 +781,10 @@ class ProceduralShapesMainWindow(QtWidgets.QMainWindow):
 
                 iscale = float(inst.get("scale", 1.0))
                 ioff = _parse_vec3_relaxed(str(inst.get("offset", "0,0,0")))
-                for c in list(els):
-                    cc = _transform_cuboid_global(c, scale=iscale, offset=ioff, pivot=pivot)
-                    if cc is not None:
-                        composed.append(cc)
+                for cub in list(els):
+                    cub_xf = _transform_cuboid_global(cub, scale=iscale, offset=ioff, pivot=pivot)
+                    if cub_xf is not None:
+                        composed.append(cub_xf)
             arr = composed
         else:
             planes = (
@@ -802,33 +828,33 @@ class ProceduralShapesMainWindow(QtWidgets.QMainWindow):
         pivot = (8.0, 0.0, 8.0)
 
         transformed: list[Cuboid] = []
-        for c in list(arr):
-            cc = _transform_cuboid_global(c, scale=gscale, offset=goff, pivot=pivot)
-            if cc is not None:
-                transformed.append(cc)
+        for cub in list(arr):
+            cub_xf = _transform_cuboid_global(cub, scale=gscale, offset=goff, pivot=pivot)
+            if cub_xf is not None:
+                transformed.append(cub_xf)
         return transformed
 
     def _append_log_text(self, text: str) -> None:
         if not hasattr(self, "_txt_log") or self._txt_log is None:
             return
-        t = str(text)
-        if not t:
+        log_text = str(text)
+        if not log_text:
             return
-        if "\n" in t:
-            parts = t.splitlines()
-            for p in parts:
-                if p != "":
-                    self._txt_log.appendPlainText(p)
+        if "\n" in log_text:
+            parts = log_text.splitlines()
+            for line in parts:
+                if line != "":
+                    self._txt_log.appendPlainText(line)
         else:
-            if t != "":
-                self._txt_log.appendPlainText(t)
+            if log_text != "":
+                self._txt_log.appendPlainText(log_text)
 
     def _install_console_capture(self) -> None:
         class _QtStream(QtCore.QObject):
             text_emitted = QtCore.Signal(str)
 
-            def write(self, s: str) -> None:
-                self.text_emitted.emit(str(s))
+            def write(self, text: str) -> None:
+                self.text_emitted.emit(str(text))
 
             def flush(self) -> None:
                 return
@@ -1446,6 +1472,7 @@ class ProceduralShapesMainWindow(QtWidgets.QMainWindow):
                 "vp_faces": bool(self._vp_faces.isChecked()),
                 "vp_translucent": bool(self._vp_translucent.isChecked()),
                 "vp_wireframe": bool(self._vp_wireframe.isChecked()),
+                "arr_project_autosave": bool(self._arr_project_autosave.isChecked()),
             },
             "instances": inst_out,
             "instances_selected": int(self._selected_instance_index()),
@@ -1482,6 +1509,7 @@ class ProceduralShapesMainWindow(QtWidgets.QMainWindow):
         self._vp_faces.setChecked(bool(arr.get("vp_faces", bool(self._vp_faces.isChecked()))))
         self._vp_translucent.setChecked(bool(arr.get("vp_translucent", bool(self._vp_translucent.isChecked()))))
         self._vp_wireframe.setChecked(bool(arr.get("vp_wireframe", bool(self._vp_wireframe.isChecked()))))
+        self._arr_project_autosave.setChecked(bool(arr.get("arr_project_autosave", bool(self._arr_project_autosave.isChecked()))))
         self._sync_viewport_render_options()
 
         raw_instances = project.get("instances", None)
@@ -1792,13 +1820,13 @@ class ProceduralShapesMainWindow(QtWidgets.QMainWindow):
         s = float(self._post_scale.value())
         min_vol = float(self._min_volume.value())
         post: list[Cuboid] = []
-        for c in list(elements):
-            cc = _scale_cuboid_about_centroid(c, s, origin_step=float(snap_step))
-            if cc is None:
+        for cub in list(elements):
+            cub_xf = _scale_cuboid_about_centroid(cub, s, origin_step=float(snap_step))
+            if cub_xf is None:
                 continue
-            if min_vol > 0.0 and _cuboid_volume(cc) < min_vol:
+            if min_vol > 0.0 and _cuboid_volume(cub_xf) < min_vol:
                 continue
-            post.append(cc)
+            post.append(cub_xf)
         return post
 
     def _make_spiral_config(self) -> SpiralConfig:
@@ -1983,6 +2011,8 @@ class ProceduralShapesMainWindow(QtWidgets.QMainWindow):
         self._lbl_status.setText(f"Loaded settings: {in_path}")
 
 
+# endregion
+# region ENTRY
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
     _apply_dark_theme(app)
@@ -1994,3 +2024,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+# endregion

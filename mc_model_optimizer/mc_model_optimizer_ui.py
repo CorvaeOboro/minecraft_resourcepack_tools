@@ -34,13 +34,7 @@ from mc_model_optimizer_core import (
     format_blockbench_json,
 )
 
-import PySide6  # noqa: F401  (ensure import error surfaces clearly)
 from PySide6 import QtCore, QtGui, QtWidgets
-
-
-# ---------------------------------------------------------------------------
-# Self-contained dark theme (mirrors mc_model_solver_ui._apply_dark_theme)
-# ---------------------------------------------------------------------------
 
 def _apply_dark_theme(app: QtWidgets.QApplication) -> None:
     app.setStyle("Fusion")

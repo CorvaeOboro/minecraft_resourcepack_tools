@@ -1,4 +1,5 @@
-"""Minecraft Build Design Planner (UI)
+"""
+Minecraft Build Design Planner (UI)
 
  UI for generating and visualizing 2D block designs (pixel shapes) useful
 for planning Minecraft builds.
@@ -22,6 +23,10 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+# region SETUP
+# PySide6 bootstrap, optional dark-theme import from the solver UI module
 
 
 def _try_import_pyside6():
@@ -51,90 +56,165 @@ except Exception:
         app.setStyle("Fusion")
 
 
+# endregion SETUP
+# region DATA
+# ThicknessRule dataclass and generation-guard constants shared across
+# the helper, shape, and UI layers
+
+
+# Maximum structuring-element radius used by the thickness brush.  This caps
+# dilation cost and prevents the UI from hanging when a very large thickness
+# is requested.  The thickness spinboxes expose ``_MAX_THICKNESS_RADIUS + 1``
+# so the largest selectable brush is a 64-block radius.
+_MAX_THICKNESS_RADIUS = 63
+
+# Upper bound on the number of points generated for a double spiral.  This
+# keeps the tool responsive and avoids overflowing the coordinate output.
+_MAX_SPIRAL_POINTS = 100_000
+
+
 @dataclass(frozen=True)
 class ThicknessRule:
     metric: str
     radius: int
 
 
-def _lerp(a: float, b: float, t: float) -> float:
-    tt = 0.0 if t < 0.0 else 1.0 if t > 1.0 else float(t)
-    return float(a) * (1.0 - tt) + float(b) * tt
+# endregion DATA
+# region HELPERS
+# Math utilities: lerp, Bresenham line rasterization, vec2 parsing,
+# metric structuring elements, Minkowski dilation, corner fill, and
+# the unified thickness-brush dispatcher
 
 
-def _bresenham(a: tuple[int, int], b: tuple[int, int]) -> list[tuple[int, int]]:
-    x0, y0 = int(a[0]), int(a[1])
-    x1, y1 = int(b[0]), int(b[1])
-    dx = abs(x1 - x0)
-    dy = abs(y1 - y0)
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
-    err = dx - dy
-    out: list[tuple[int, int]] = []
+def _lerp(value_start: float, value_end: float, t: float) -> float:
+    t_clamped = 0.0 if t < 0.0 else 1.0 if t > 1.0 else float(t)
+    return float(value_start) * (1.0 - t_clamped) + float(value_end) * t_clamped
+
+
+def _bresenham(point_start: tuple[int, int], point_end: tuple[int, int]) -> list[tuple[int, int]]:
+    x_start, y_start = int(point_start[0]), int(point_start[1])
+    x_end, y_end = int(point_end[0]), int(point_end[1])
+    delta_x = abs(x_end - x_start)
+    delta_y = abs(y_end - y_start)
+    step_x = 1 if x_start < x_end else -1
+    step_y = 1 if y_start < y_end else -1
+    error = delta_x - delta_y
+    rasterized_points: list[tuple[int, int]] = []
     while True:
-        out.append((int(x0), int(y0)))
-        if x0 == x1 and y0 == y1:
+        rasterized_points.append((int(x_start), int(y_start)))
+        if x_start == x_end and y_start == y_end:
             break
-        e2 = 2 * err
-        if e2 > -dy:
-            err -= dy
-            x0 += sx
-        if e2 < dx:
-            err += dx
-            y0 += sy
-    return out
+        error2 = 2 * error
+        if error2 > -delta_y:
+            error -= delta_y
+            x_start += step_x
+        if error2 < delta_x:
+            error += delta_x
+            y_start += step_y
+    return rasterized_points
 
 
-def _parse_vec2(raw: str) -> tuple[int, int]:
-    parts = [p.strip() for p in raw.split(",")]
-    if len(parts) != 2:
+def _parse_vec2(raw_text: str) -> tuple[int, int]:
+    """Parse a "x,z" string into integer block coordinates.
+
+    Floating-point values are accepted only when they are numerically equal
+    to an integer (e.g. "12.0,-3.0"); otherwise a ``ValueError`` is raised so
+    the caller can notify the user instead of silently rounding.
+    """
+    parts_str = [p.strip() for p in raw_text.split(",")]
+    if len(parts_str) != 2:
         raise ValueError("Expected x,z")
-    return int(round(float(parts[0]))), int(round(float(parts[1])))
+
+    parsed_values = []
+    for part_str in parts_str:
+        value_float = float(part_str)
+        value_rounded = round(value_float)
+        if not math.isclose(value_float, value_rounded, abs_tol=1e-6):
+            raise ValueError(f"Center coordinate {part_str!r} is not an integer")
+        parsed_values.append(int(value_rounded))
+    return parsed_values[0], parsed_values[1]
 
 
 def _neighbors_within(rule: ThicknessRule) -> list[tuple[int, int]]:
-    r = int(rule.radius)
-    if r <= 0:
+    radius = int(rule.radius)
+    if radius <= 0:
         return [(0, 0)]
 
-    out: list[tuple[int, int]] = []
-    for dz in range(-r, r + 1):
-        for dx in range(-r, r + 1):
-            adx = abs(int(dx))
-            adz = abs(int(dz))
+    offsets: list[tuple[int, int]] = []
+    for dz in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            abs_dx = abs(int(dx))
+            abs_dz = abs(int(dz))
             if rule.metric == "manhattan":
-                if (adx + adz) <= r:
-                    out.append((dx, dz))
+                if (abs_dx + abs_dz) <= radius:
+                    offsets.append((dx, dz))
             elif rule.metric == "chebyshev":
-                if max(adx, adz) <= r:
-                    out.append((dx, dz))
+                if max(abs_dx, abs_dz) <= radius:
+                    offsets.append((dx, dz))
             else:
-                if (dx * dx + dz * dz) <= (r * r):
-                    out.append((dx, dz))
-    return out
+                if (dx * dx + dz * dz) <= (radius * radius):
+                    offsets.append((dx, dz))
+    return offsets
 
 
 def _dilate(points: set[tuple[int, int]], *, rule: ThicknessRule) -> set[tuple[int, int]]:
+    """Minkowski sum of ``points`` with the structuring element from ``rule``.
+
+    The cost is ``|points| * |offsets|`` so very large radii are rejected to
+    keep the tool responsive.
+    """
+    radius = int(rule.radius)
+    if radius > _MAX_THICKNESS_RADIUS:
+        raise ValueError(
+            f"Thickness radius {radius} exceeds maximum {_MAX_THICKNESS_RADIUS}; "
+            "reduce the thickness value."
+        )
+
     offsets = _neighbors_within(rule)
-    out: set[tuple[int, int]] = set()
+    dilated_points: set[tuple[int, int]] = set()
     for x, z in points:
         for dx, dz in offsets:
-            out.add((int(x) + int(dx), int(z) + int(dz)))
-    return out
+            dilated_points.add((int(x) + int(dx), int(z) + int(dz)))
+    return dilated_points
 
 
 def _corner_fill(points: set[tuple[int, int]]) -> set[tuple[int, int]]:
     if not points:
         return set()
 
-    out = set(points)
-    diags = ((1, 1), (1, -1), (-1, 1), (-1, -1))
+    filled_points = set(points)
+    diagonal_offsets = ((1, 1), (1, -1), (-1, 1), (-1, -1))
     for x, z in points:
-        for dx, dz in diags:
+        for dx, dz in diagonal_offsets:
             if (int(x) + int(dx), int(z) + int(dz)) in points:
-                out.add((int(x) + int(dx), int(z)))
-                out.add((int(x), int(z) + int(dz)))
-    return out
+                filled_points.add((int(x) + int(dx), int(z)))
+                filled_points.add((int(x), int(z) + int(dz)))
+    return filled_points
+
+
+def _apply_thickness(
+    points: set[tuple[int, int]], *, metric: str, thick: int
+) -> set[tuple[int, int]]:
+    """Apply a metric brush of ``thick`` blocks to ``points``.
+
+    The thickness value follows the convention ``radius = thick - 1`` so
+    that a thickness of 1 leaves the rasterized line exactly one block wide.
+    Chebyshev metric with thickness 1 also applies corner-filling so that
+    diagonal steps of the rasterized curve are connected under the square
+    (Chebyshev) metric.
+    """
+    brushed_points = set(points)
+    if metric == "chebyshev" and thick == 1:
+        brushed_points = _corner_fill(brushed_points)
+    elif thick > 1:
+        rule = ThicknessRule(metric=metric, radius=int(thick - 1))
+        brushed_points = _dilate(brushed_points, rule=rule)
+    return brushed_points
+
+
+# endregion HELPERS
+# region SHAPES
+# 2D integer rasterizers: scanline circle fill and double Archimedean spiral
 
 
 def _gen_circle_points(
@@ -143,27 +223,49 @@ def _gen_circle_points(
     radius: float,
     filled: bool,
 ) -> set[tuple[int, int]]:
+    """Generate pixelated integer circle points using a scanline fill.
+
+    For ``filled=True`` every integer grid point whose distance from the
+    centre is at most ``radius + 0.5`` is included.  For ``filled=False``
+    only the ring satisfying ``abs(distance - radius) <= 0.5`` is included.
+
+    The scanline approach walks only rows that can intersect the shape,
+    avoiding the full square bounding-box scan used by an earlier version.
+    """
     cx, cz = center
-    r = float(radius)
-    if r <= 0.0:
+    radius_float = float(radius)
+    if radius_float <= 0.0:
         return set()
 
-    rr = int(math.ceil(r + 2.0))
-    out: set[tuple[int, int]] = set()
+    circle_points: set[tuple[int, int]] = set()
+    scan_radius = int(math.ceil(radius_float + 0.5))
 
-    for z in range(int(cz) - rr, int(cz) + rr + 1):
-        for x in range(int(cx) - rr, int(cx) + rr + 1):
+    radius_outer = radius_float + 0.5
+    radius_outer_sq = radius_outer * radius_outer
+
+    if filled:
+        radius_inner_sq = -1.0
+    else:
+        radius_inner = max(0.0, radius_float - 0.5)
+        radius_inner_sq = radius_inner * radius_inner
+
+    for z in range(int(cz) - scan_radius, int(cz) + scan_radius + 1):
+        dz = float(z) - float(cz)
+        dz_sq = dz * dz
+        if dz_sq > radius_outer_sq:
+            continue
+
+        half_width = math.sqrt(radius_outer_sq - dz_sq)
+        x_start = int(math.ceil(float(cx) - half_width))
+        x_end = int(math.floor(float(cx) + half_width))
+
+        for x in range(x_start, x_end + 1):
             dx = float(x) - float(cx)
-            dz = float(z) - float(cz)
-            d = math.sqrt(dx * dx + dz * dz)
-            if filled:
-                if d <= (r + 0.5):
-                    out.add((int(x), int(z)))
-            else:
-                if abs(d - r) <= 0.5:
-                    out.add((int(x), int(z)))
+            dist_sq = dx * dx + dz_sq
+            if radius_inner_sq <= dist_sq <= radius_outer_sq:
+                circle_points.add((x, z))
 
-    return out
+    return circle_points
 
 
 def _gen_double_spiral_points(
@@ -175,63 +277,97 @@ def _gen_double_spiral_points(
     segments: int,
     max_chord_step: float,
 ) -> set[tuple[int, int]]:
+    """Generate a rasterized double Archimedean spiral.
+
+    Two arms are drawn 180 degrees apart.  The spiral is refined until the
+    chord between consecutive samples is no larger than ``max_chord_step``.
+    Pathological settings (extremely small spacing or huge radius limit) are
+    rejected before generation so the tool cannot hang.
+    """
     cx, cz = center
-    rlim = float(radius_limit)
-    if rlim <= 0.0:
+    radius_limit_float = float(radius_limit)
+    if radius_limit_float <= 0.0:
         return set()
 
-    sp = float(spacing)
-    if sp <= 1e-9:
-        sp = 1.0
+    spacing_float = float(spacing)
+    if spacing_float <= 1e-9:
+        spacing_float = 1.0
 
-    turns = float(rlim) / float(sp)
+    turns = float(radius_limit_float) / float(spacing_float)
     turns = max(0.0, float(turns))
+    if turns > 1000.0:
+        raise ValueError(
+            f"Spiral too dense ({turns:.0f} turns). "
+            "Increase the spacing or reduce the radius limit."
+        )
 
-    segs = max(8, int(segments))
-    max_step = float(max_chord_step)
-    max_step = 0.0 if max_step < 0.0 else float(max_step)
+    segment_count = max(8, int(segments))
+    # Ensure the base sampling is fine enough relative to the number of turns
+    # so that chord refinement does not explode.
+    segment_count = max(segment_count, min(8192, int(math.ceil(turns * 4.0))))
+    segment_count = min(8192, segment_count)
 
-    guide_rad = math.radians(float(guide_rotation_deg))
+    max_chord_step_float = float(max_chord_step)
+    max_chord_step_float = 0.0 if max_chord_step_float < 0.0 else float(max_chord_step_float)
 
-    def spiral_point(tt: float, phase: float) -> tuple[float, float]:
-        a = (2.0 * math.pi) * float(turns) * float(tt) + float(phase) + float(guide_rad)
-        r = _lerp(0.0, float(rlim), float(tt))
-        return (float(cx) + r * math.cos(a), float(cz) + r * math.sin(a))
+    if max_chord_step_float > 1e-9:
+        # Estimate total arc length as ~ pi * radius_limit * turns.  The
+        # number of refined samples is roughly that divided by max_chord_step.
+        estimated_points = int(math.ceil(math.pi * radius_limit_float * turns / max_chord_step_float))
+        if estimated_points > _MAX_SPIRAL_POINTS:
+            raise ValueError(
+                f"Estimated spiral points ({estimated_points:,}) exceeds the "
+                f"limit ({_MAX_SPIRAL_POINTS:,}). Increase the max chord step, "
+                "increase the spacing, or reduce the radius limit."
+            )
 
-    t_breaks: list[float] = []
-    for i in range(segs + 1):
-        t_breaks.append(float(i) / float(segs))
+    guide_rotation_rad = math.radians(float(guide_rotation_deg))
 
-    if max_step > 1e-9:
-        refined: list[float] = [float(t_breaks[0])]
-        for i in range(len(t_breaks) - 1):
-            ta = float(t_breaks[i])
-            tb = float(t_breaks[i + 1])
-            ax, az = spiral_point(ta, 0.0)
-            bx, bz = spiral_point(tb, 0.0)
-            L = math.hypot(float(bx - ax), float(bz - az))
-            n = int(max(1.0, math.ceil(float(L) / float(max_step))))
-            for k in range(1, n + 1):
-                refined.append(ta + (tb - ta) * (float(k) / float(n)))
-        t_breaks = refined
+    def spiral_point(t_normalized: float, phase: float) -> tuple[float, float]:
+        angle_rad = (2.0 * math.pi) * float(turns) * float(t_normalized) + float(phase) + float(guide_rotation_rad)
+        spiral_radius = _lerp(0.0, float(radius_limit_float), float(t_normalized))
+        return (float(cx) + spiral_radius * math.cos(angle_rad), float(cz) + spiral_radius * math.sin(angle_rad))
+
+    t_samples: list[float] = []
+    for i in range(segment_count + 1):
+        t_samples.append(float(i) / float(segment_count))
+
+    if max_chord_step_float > 1e-9:
+        refined_samples: list[float] = [float(t_samples[0])]
+        for i in range(len(t_samples) - 1):
+            t_start = float(t_samples[i])
+            t_end = float(t_samples[i + 1])
+            point_a_x, point_a_z = spiral_point(t_start, 0.0)
+            point_b_x, point_b_z = spiral_point(t_end, 0.0)
+            chord_length = math.hypot(float(point_b_x - point_a_x), float(point_b_z - point_a_z))
+            subdivisions = int(max(1.0, math.ceil(float(chord_length) / float(max_chord_step_float))))
+            for subdiv_index in range(1, subdivisions + 1):
+                refined_samples.append(t_start + (t_end - t_start) * (float(subdiv_index) / float(subdivisions)))
+        t_samples = refined_samples
 
     def rasterize_arm(phase: float) -> set[tuple[int, int]]:
-        pts: set[tuple[int, int]] = set()
-        prev: Optional[tuple[int, int]] = None
-        for tt in t_breaks:
-            x, z = spiral_point(float(tt), float(phase))
-            cur = (int(round(x)), int(round(z)))
-            if prev is None:
-                pts.add(cur)
-                prev = cur
+        arm_points: set[tuple[int, int]] = set()
+        first_t = float(t_samples[0])
+        x, z = spiral_point(first_t, float(phase))
+        prev_point: tuple[int, int] = (int(round(x)), int(round(z)))
+        arm_points.add(prev_point)
+        for t_normalized in t_samples[1:]:
+            x, z = spiral_point(float(t_normalized), float(phase))
+            current_point = (int(round(x)), int(round(z)))
+            if current_point == prev_point:
                 continue
-            for p in _bresenham(prev, cur):
-                pts.add(p)
-            prev = cur
-        return pts
+            for line_point in _bresenham(prev_point, current_point):
+                arm_points.add(line_point)
+            prev_point = current_point
+        return arm_points
 
-    out = rasterize_arm(0.0) | rasterize_arm(math.pi)
-    return out
+    spiral_points = rasterize_arm(0.0) | rasterize_arm(math.pi)
+    return spiral_points
+
+
+# endregion SHAPES
+# region ASCII
+# Block-character grid renderer for the coordinate output tab
 
 
 def _points_to_ascii(
@@ -241,16 +377,22 @@ def _points_to_ascii(
     on: str,
     off: str,
 ) -> str:
+    """Render ``points`` as a block-character grid.
+
+    The output is oriented so that the positive Z axis points up and the
+    positive X axis points right.  This matches the in-game Minecraft XZ plane
+    where +Z is south and +X is east.
+    """
     if not points:
         return ""
 
-    xs = [p[0] for p in points]
-    zs = [p[1] for p in points]
+    x_coords = [p[0] for p in points]
+    z_coords = [p[1] for p in points]
 
-    min_x = min(xs) - int(pad)
-    max_x = max(xs) + int(pad)
-    min_z = min(zs) - int(pad)
-    max_z = max(zs) + int(pad)
+    min_x = min(x_coords) - int(pad)
+    max_x = max(x_coords) + int(pad)
+    min_z = min(z_coords) - int(pad)
+    max_z = max(z_coords) + int(pad)
 
     lines: list[str] = []
     for z in range(int(max_z), int(min_z) - 1, -1):
@@ -262,16 +404,22 @@ def _points_to_ascii(
     return "\n".join(lines)
 
 
+# endregion ASCII
+# region VIEWPORT
+# 2D pan/zoom grid viewport with world-to-screen projection, grid lines,
+# axis overlays, and colored block-cell rendering
+
+
 class GridViewport2D(QtWidgets.QWidget):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
 
-        self._points: dict[tuple[int, int], QtGui.QColor] = {}
-        self._zoom = 24.0
-        self._pan = QtCore.QPointF(0.0, 0.0)
-        self._last_mouse: Optional[QtCore.QPoint] = None
+        self._points_colored: dict[tuple[int, int], QtGui.QColor] = {}
+        self._zoom_factor = 24.0
+        self._pan_offset = QtCore.QPointF(0.0, 0.0)
+        self._last_mouse_pos: Optional[QtCore.QPoint] = None
         self._show_grid = True
         self._show_axes = True
 
@@ -284,82 +432,88 @@ class GridViewport2D(QtWidgets.QWidget):
         self.update()
 
     def clear(self) -> None:
-        self._points = {}
+        self._points_colored = {}
         self.update()
 
     def set_points(self, pts: dict[tuple[int, int], QtGui.QColor]) -> None:
-        self._points = dict(pts)
+        self._points_colored = dict(pts)
         self.update()
 
     def fit_to_points(self) -> None:
-        if not self._points:
-            self._pan = QtCore.QPointF(0.0, 0.0)
-            self._zoom = 24.0
+        if not self._points_colored:
+            self._pan_offset = QtCore.QPointF(0.0, 0.0)
+            self._zoom_factor = 24.0
             self.update()
             return
 
-        xs = [p[0] for p in self._points.keys()]
-        zs = [p[1] for p in self._points.keys()]
-        min_x, max_x = min(xs), max(xs)
-        min_z, max_z = min(zs), max(zs)
+        x_coords = [p[0] for p in self._points_colored.keys()]
+        z_coords = [p[1] for p in self._points_colored.keys()]
+        min_x, max_x = min(x_coords), max(x_coords)
+        min_z, max_z = min(z_coords), max(z_coords)
 
-        w = max(1, self.width())
-        h = max(1, self.height())
+        width_px = max(1, self.width())
+        height_px = max(1, self.height())
 
         span_x = max(1.0, float(max_x - min_x + 3))
         span_z = max(1.0, float(max_z - min_z + 3))
 
-        cell_x = float(w) / span_x
-        cell_z = float(h) / span_z
-        self._zoom = max(6.0, min(80.0, min(cell_x, cell_z)))
+        cell_size_x = float(width_px) / span_x
+        cell_size_z = float(height_px) / span_z
+        self._zoom_factor = max(6.0, min(80.0, min(cell_size_x, cell_size_z)))
 
-        cx = (float(min_x) + float(max_x)) * 0.5
-        cz = (float(min_z) + float(max_z)) * 0.5
-        self._pan = QtCore.QPointF(-cx * self._zoom, cz * self._zoom)
+        center_x = (float(min_x) + float(max_x)) * 0.5
+        center_z = (float(min_z) + float(max_z)) * 0.5
+        self._pan_offset = QtCore.QPointF(-center_x * self._zoom_factor, center_z * self._zoom_factor)
         self.update()
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
-        delta = event.angleDelta().y() / 120.0
-        if delta == 0.0:
+        wheel_delta = event.angleDelta().y() / 120.0
+        if wheel_delta == 0.0:
             return
 
-        before = float(self._zoom)
-        self._zoom *= 1.15 ** float(delta)
-        self._zoom = max(4.0, min(140.0, self._zoom))
-        after = float(self._zoom)
+        zoom_before = float(self._zoom_factor)
+        self._zoom_factor *= 1.15 ** float(wheel_delta)
+        self._zoom_factor = max(4.0, min(140.0, self._zoom_factor))
+        zoom_after = float(self._zoom_factor)
 
-        if abs(after - before) > 1e-9:
-            p = event.position()
-            cx = float(self.width()) * 0.5
-            cy = float(self.height()) * 0.5
-            sx = float(p.x()) - cx
-            sy = float(p.y()) - cy
-            if before > 1e-9:
-                scale = after / before
-                self._pan = QtCore.QPointF(float(self._pan.x()) * scale + sx * (1.0 - scale), float(self._pan.y()) * scale + sy * (1.0 - scale))
+        if abs(zoom_after - zoom_before) > 1e-9:
+            mouse_pos = event.position()
+            screen_center_x = float(self.width()) * 0.5
+            screen_center_y = float(self.height()) * 0.5
+            mouse_offset_x = float(mouse_pos.x()) - screen_center_x
+            mouse_offset_y = float(mouse_pos.y()) - screen_center_y
+            if zoom_before > 1e-9:
+                zoom_scale = zoom_after / zoom_before
+                self._pan_offset = QtCore.QPointF(
+                    float(self._pan_offset.x()) * zoom_scale + mouse_offset_x * (1.0 - zoom_scale),
+                    float(self._pan_offset.y()) * zoom_scale + mouse_offset_y * (1.0 - zoom_scale),
+                )
         self.update()
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            self._last_mouse = event.position().toPoint()
+            self._last_mouse_pos = event.position().toPoint()
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            self._last_mouse = None
+            self._last_mouse_pos = None
             event.accept()
             return
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
-        if self._last_mouse is not None:
-            p = event.position().toPoint()
-            dx = p.x() - self._last_mouse.x()
-            dy = p.y() - self._last_mouse.y()
-            self._last_mouse = p
-            self._pan = QtCore.QPointF(float(self._pan.x()) + float(dx), float(self._pan.y()) + float(dy))
+        if self._last_mouse_pos is not None:
+            mouse_pos = event.position().toPoint()
+            delta_x = mouse_pos.x() - self._last_mouse_pos.x()
+            delta_y = mouse_pos.y() - self._last_mouse_pos.y()
+            self._last_mouse_pos = mouse_pos
+            self._pan_offset = QtCore.QPointF(
+                float(self._pan_offset.x()) + float(delta_x),
+                float(self._pan_offset.y()) + float(delta_y),
+            )
             self.update()
             event.accept()
             return
@@ -370,70 +524,81 @@ class GridViewport2D(QtWidgets.QWidget):
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
         painter.fillRect(self.rect(), QtGui.QColor(6, 6, 8))
 
-        w = max(1, self.width())
-        h = max(1, self.height())
-        cx = float(w) * 0.5
-        cy = float(h) * 0.5
+        width_px = max(1, self.width())
+        height_px = max(1, self.height())
+        screen_center_x = float(width_px) * 0.5
+        screen_center_y = float(height_px) * 0.5
 
         def world_to_screen(x: float, z: float) -> QtCore.QPointF:
-            sx = cx + float(self._pan.x()) + (x * float(self._zoom))
-            sy = cy + float(self._pan.y()) - (z * float(self._zoom))
-            return QtCore.QPointF(float(sx), float(sy))
+            screen_x = screen_center_x + float(self._pan_offset.x()) + (x * float(self._zoom_factor))
+            screen_y = screen_center_y + float(self._pan_offset.y()) - (z * float(self._zoom_factor))
+            return QtCore.QPointF(float(screen_x), float(screen_y))
 
-        def screen_to_world(p: QtCore.QPointF) -> tuple[float, float]:
-            x = (float(p.x()) - cx - float(self._pan.x())) / float(self._zoom)
-            z = -(float(p.y()) - cy - float(self._pan.y())) / float(self._zoom)
+        def screen_to_world(screen_point: QtCore.QPointF) -> tuple[float, float]:
+            x = (float(screen_point.x()) - screen_center_x - float(self._pan_offset.x())) / float(self._zoom_factor)
+            z = -(float(screen_point.y()) - screen_center_y - float(self._pan_offset.y())) / float(self._zoom_factor)
             return float(x), float(z)
 
-        if self._show_grid and float(self._zoom) >= 10.0:
-            tl = screen_to_world(QtCore.QPointF(0.0, 0.0))
-            br = screen_to_world(QtCore.QPointF(float(w), float(h)))
-            min_x = int(math.floor(min(tl[0], br[0]))) - 1
-            max_x = int(math.ceil(max(tl[0], br[0]))) + 1
-            min_z = int(math.floor(min(tl[1], br[1]))) - 1
-            max_z = int(math.ceil(max(tl[1], br[1]))) + 1
+        if self._show_grid and float(self._zoom_factor) >= 10.0:
+            top_left_world = screen_to_world(QtCore.QPointF(0.0, 0.0))
+            bottom_right_world = screen_to_world(QtCore.QPointF(float(width_px), float(height_px)))
+            min_x = int(math.floor(min(top_left_world[0], bottom_right_world[0]))) - 1
+            max_x = int(math.ceil(max(top_left_world[0], bottom_right_world[0]))) + 1
+            min_z = int(math.floor(min(top_left_world[1], bottom_right_world[1]))) - 1
+            max_z = int(math.ceil(max(top_left_world[1], bottom_right_world[1]))) + 1
 
-            grid_col = QtGui.QColor(25, 26, 30, 255)
-            axis_col = QtGui.QColor(42, 62, 96, 255)
+            grid_color = QtGui.QColor(25, 26, 30, 255)
+            axis_color = QtGui.QColor(42, 62, 96, 255)
 
-            pen = QtGui.QPen(grid_col)
-            pen.setWidthF(1.0)
-            painter.setPen(pen)
-            z0 = float(min_z) - 0.5
-            z1 = float(max_z) + 0.5
-            x0 = float(min_x) - 0.5
-            x1 = float(max_x) + 0.5
+            grid_pen = QtGui.QPen(grid_color)
+            grid_pen.setWidthF(1.0)
+            painter.setPen(grid_pen)
+            grid_z_min = float(min_z) - 0.5
+            grid_z_max = float(max_z) + 0.5
+            grid_x_min = float(min_x) - 0.5
+            grid_x_max = float(max_x) + 0.5
             for x in range(min_x, max_x + 2):
-                gx = float(x) + 0.5
-                p0 = world_to_screen(float(gx), float(z0))
-                p1 = world_to_screen(float(gx), float(z1))
-                painter.drawLine(p0, p1)
+                grid_x = float(x) + 0.5
+                line_start = world_to_screen(float(grid_x), float(grid_z_min))
+                line_end = world_to_screen(float(grid_x), float(grid_z_max))
+                painter.drawLine(line_start, line_end)
             for z in range(min_z, max_z + 2):
-                gz = float(z) + 0.5
-                p0 = world_to_screen(float(x0), float(gz))
-                p1 = world_to_screen(float(x1), float(gz))
-                painter.drawLine(p0, p1)
+                grid_z = float(z) + 0.5
+                line_start = world_to_screen(float(grid_x_min), float(grid_z))
+                line_end = world_to_screen(float(grid_x_max), float(grid_z))
+                painter.drawLine(line_start, line_end)
 
             if self._show_axes:
-                pen2 = QtGui.QPen(axis_col)
-                pen2.setWidthF(1.6)
-                painter.setPen(pen2)
+                axis_pen = QtGui.QPen(axis_color)
+                axis_pen.setWidthF(1.6)
+                painter.setPen(axis_pen)
                 painter.drawLine(world_to_screen(float(min_x), 0.0), world_to_screen(float(max_x), 0.0))
                 painter.drawLine(world_to_screen(0.0, float(min_z)), world_to_screen(0.0, float(max_z)))
 
-        if self._points:
+        if self._points_colored:
             painter.setPen(QtCore.Qt.PenStyle.NoPen)
-            cell = float(self._zoom)
-            pad = 0.9 if cell >= 10.0 else 0.0
-            s = max(1.0, cell - pad)
+            cell_size = float(self._zoom_factor)
+            cell_pad = 0.9 if cell_size >= 10.0 else 0.0
+            cell_size_drawn = max(1.0, cell_size - cell_pad)
 
-            for (x, z), col in self._points.items():
-                p = world_to_screen(float(x), float(z))
-                rect = QtCore.QRectF(float(p.x() - s * 0.5), float(p.y() - s * 0.5), float(s), float(s))
-                painter.setBrush(QtGui.QBrush(col))
-                painter.drawRect(rect)
+            for (x, z), point_color in self._points_colored.items():
+                screen_pos = world_to_screen(float(x), float(z))
+                cell_rect = QtCore.QRectF(
+                    float(screen_pos.x() - cell_size_drawn * 0.5),
+                    float(screen_pos.y() - cell_size_drawn * 0.5),
+                    float(cell_size_drawn),
+                    float(cell_size_drawn),
+                )
+                painter.setBrush(QtGui.QBrush(point_color))
+                painter.drawRect(cell_rect)
 
         painter.end()
+
+
+# endregion VIEWPORT
+# region MAINWIN
+# BuildDesignPlannerMainWindow: scene/circle/spiral controls, output tabs,
+# point composition, generate/clear/save handlers, and section enable-sync
 
 
 class BuildDesignPlannerMainWindow(QtWidgets.QMainWindow):
@@ -443,14 +608,14 @@ class BuildDesignPlannerMainWindow(QtWidgets.QMainWindow):
 
         self._viewport = GridViewport2D()
 
-        controls = self._build_controls()
-        output = self._build_output()
+        controls_widget = self._build_controls()
+        output_widget = self._build_output()
 
         splitter = QtWidgets.QSplitter()
         splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
-        splitter.addWidget(controls)
+        splitter.addWidget(controls_widget)
         splitter.addWidget(self._viewport)
-        splitter.addWidget(output)
+        splitter.addWidget(output_widget)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
@@ -464,8 +629,8 @@ class BuildDesignPlannerMainWindow(QtWidgets.QMainWindow):
         self._sync_enable_sections()
 
     def _build_controls(self) -> QtWidgets.QWidget:
-        w = QtWidgets.QWidget()
-        w.setMinimumWidth(360)
+        controls_widget = QtWidgets.QWidget()
+        controls_widget.setMinimumWidth(360)
 
         self._center_xz = QtWidgets.QLineEdit("0,0")
         self._y_level = QtWidgets.QSpinBox()
@@ -507,7 +672,7 @@ class BuildDesignPlannerMainWindow(QtWidgets.QMainWindow):
         self._circle_filled.setChecked(False)
 
         self._circle_thickness = QtWidgets.QSpinBox()
-        self._circle_thickness.setRange(1, 512)
+        self._circle_thickness.setRange(1, _MAX_THICKNESS_RADIUS + 1)
         self._circle_thickness.setValue(1)
 
         self._circle_metric = QtWidgets.QComboBox()
@@ -544,7 +709,7 @@ class BuildDesignPlannerMainWindow(QtWidgets.QMainWindow):
         self._spiral_max_chord_step.setValue(0.75)
 
         self._spiral_thickness = QtWidgets.QSpinBox()
-        self._spiral_thickness.setRange(1, 512)
+        self._spiral_thickness.setRange(1, _MAX_THICKNESS_RADIUS + 1)
         self._spiral_thickness.setValue(1)
 
         self._spiral_metric = QtWidgets.QComboBox()
@@ -594,145 +759,137 @@ class BuildDesignPlannerMainWindow(QtWidgets.QMainWindow):
         spiral_form.addRow("Thickness", self._spiral_thickness)
         spiral_form.addRow("Thickness metric", self._spiral_metric)
 
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.addWidget(self._btn_generate)
-        btn_row.addWidget(self._btn_clear)
+        buttons_row = QtWidgets.QHBoxLayout()
+        buttons_row.addWidget(self._btn_generate)
+        buttons_row.addWidget(self._btn_clear)
 
-        btn_row2 = QtWidgets.QHBoxLayout()
-        btn_row2.addWidget(self._btn_save)
+        save_button_row = QtWidgets.QHBoxLayout()
+        save_button_row.addWidget(self._btn_save)
 
-        layout = QtWidgets.QVBoxLayout(w)
-        layout.addWidget(scene_box)
-        layout.addWidget(circle_box)
-        layout.addWidget(spiral_box)
-        layout.addWidget(vp_box)
-        layout.addLayout(btn_row)
-        layout.addLayout(btn_row2)
-        layout.addWidget(self._lbl_status)
-        layout.addStretch(1)
-        return w
+        controls_layout = QtWidgets.QVBoxLayout(controls_widget)
+        controls_layout.addWidget(scene_box)
+        controls_layout.addWidget(circle_box)
+        controls_layout.addWidget(spiral_box)
+        controls_layout.addWidget(vp_box)
+        controls_layout.addLayout(buttons_row)
+        controls_layout.addLayout(save_button_row)
+        controls_layout.addWidget(self._lbl_status)
+        controls_layout.addStretch(1)
+        return controls_widget
 
     def _build_output(self) -> QtWidgets.QWidget:
-        w = QtWidgets.QWidget()
-        w.setMinimumWidth(460)
-        w.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Expanding)
+        output_widget = QtWidgets.QWidget()
+        output_widget.setMinimumWidth(460)
+        output_widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Expanding)
 
         self._txt_coords = QtWidgets.QPlainTextEdit()
         self._txt_coords.setReadOnly(True)
-        self._txt_coords.setMaximumBlockCount(20000)
+        self._txt_coords.setMaximumBlockCount(100000)
         self._txt_coords.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
         self._txt_coords.setFont(QtGui.QFont("Consolas", 10))
 
         self._txt_ascii = QtWidgets.QPlainTextEdit()
         self._txt_ascii.setReadOnly(True)
-        self._txt_ascii.setMaximumBlockCount(20000)
+        self._txt_ascii.setMaximumBlockCount(100000)
         self._txt_ascii.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
         self._txt_ascii.setFont(QtGui.QFont("Consolas", 10))
 
-        tabs = QtWidgets.QTabWidget()
-        tabs.addTab(self._txt_coords, "Coords")
-        tabs.addTab(self._txt_ascii, "ASCII")
+        output_tabs = QtWidgets.QTabWidget()
+        output_tabs.addTab(self._txt_coords, "Coords")
+        output_tabs.addTab(self._txt_ascii, "ASCII")
 
-        box = QtWidgets.QGroupBox("Output")
-        box_layout = QtWidgets.QVBoxLayout(box)
-        box_layout.setContentsMargins(10, 10, 10, 10)
-        box_layout.addWidget(tabs)
+        output_box = QtWidgets.QGroupBox("Output")
+        output_box_layout = QtWidgets.QVBoxLayout(output_box)
+        output_box_layout.setContentsMargins(10, 10, 10, 10)
+        output_box_layout.addWidget(output_tabs)
 
-        layout = QtWidgets.QVBoxLayout(w)
-        layout.addWidget(box)
-        layout.setContentsMargins(0, 0, 0, 0)
-        return w
+        output_layout = QtWidgets.QVBoxLayout(output_widget)
+        output_layout.addWidget(output_box)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        return output_widget
 
     def _sync_enable_sections(self) -> None:
-        circle_on = bool(self._circle_enable.isChecked())
-        self._circle_radius.setEnabled(circle_on)
-        self._circle_filled.setEnabled(circle_on)
-        self._circle_thickness.setEnabled(circle_on)
-        self._circle_metric.setEnabled(circle_on)
+        circle_enabled = bool(self._circle_enable.isChecked())
+        self._circle_radius.setEnabled(circle_enabled)
+        self._circle_filled.setEnabled(circle_enabled)
+        self._circle_thickness.setEnabled(circle_enabled)
+        self._circle_metric.setEnabled(circle_enabled)
 
-        spiral_on = bool(self._spiral_enable.isChecked())
-        self._spiral_radius_limit.setEnabled(spiral_on)
-        self._spiral_spacing.setEnabled(spiral_on)
-        self._spiral_guide_rotation.setEnabled(spiral_on)
-        self._spiral_segments.setEnabled(spiral_on)
-        self._spiral_max_chord_step.setEnabled(spiral_on)
-        self._spiral_thickness.setEnabled(spiral_on)
-        self._spiral_metric.setEnabled(spiral_on)
+        spiral_enabled = bool(self._spiral_enable.isChecked())
+        self._spiral_radius_limit.setEnabled(spiral_enabled)
+        self._spiral_spacing.setEnabled(spiral_enabled)
+        self._spiral_guide_rotation.setEnabled(spiral_enabled)
+        self._spiral_segments.setEnabled(spiral_enabled)
+        self._spiral_max_chord_step.setEnabled(spiral_enabled)
+        self._spiral_thickness.setEnabled(spiral_enabled)
+        self._spiral_metric.setEnabled(spiral_enabled)
 
     def _compose_points(self) -> tuple[dict[tuple[int, int], QtGui.QColor], set[tuple[int, int]]]:
         center = _parse_vec2(self._center_xz.text().strip())
 
-        pts_colored: dict[tuple[int, int], QtGui.QColor] = {}
-        pts_all: set[tuple[int, int]] = set()
+        points_colored: dict[tuple[int, int], QtGui.QColor] = {}
+        points_all: set[tuple[int, int]] = set()
 
         if bool(self._circle_enable.isChecked()):
             radius = float(self._circle_radius.value())
             filled = bool(self._circle_filled.isChecked())
-            p = _gen_circle_points(center=center, radius=radius, filled=filled)
+            shape_points = _gen_circle_points(center=center, radius=radius, filled=filled)
 
-            thick = int(self._circle_thickness.value())
-            metric = str(self._circle_metric.currentData() or "euclidean")
-            if thick <= 1 and metric == "chebyshev":
-                p = _corner_fill(p)
-            if thick > 1:
-                rule = ThicknessRule(metric=metric, radius=int(thick - 1))
-                p = _dilate(p, rule=rule)
+            thickness = int(self._circle_thickness.value())
+            metric_name = str(self._circle_metric.currentData() or "euclidean")
+            shape_points = _apply_thickness(shape_points, metric=metric_name, thick=thickness)
 
-            for q in p:
-                pts_colored[q] = QtGui.QColor(95, 170, 255, 215)
-            pts_all |= p
+            for point in shape_points:
+                points_colored[point] = QtGui.QColor(95, 170, 255, 215)
+            points_all |= shape_points
 
         if bool(self._spiral_enable.isChecked()):
-            rlim = float(self._spiral_radius_limit.value())
+            radius_limit = float(self._spiral_radius_limit.value())
             spacing = float(self._spiral_spacing.value())
             guide_rotation = float(self._spiral_guide_rotation.value())
             segments = int(self._spiral_segments.value())
             max_chord_step = float(self._spiral_max_chord_step.value())
-            p = _gen_double_spiral_points(
+            shape_points = _gen_double_spiral_points(
                 center=center,
-                radius_limit=rlim,
+                radius_limit=radius_limit,
                 spacing=spacing,
                 guide_rotation_deg=guide_rotation,
                 segments=segments,
                 max_chord_step=max_chord_step,
             )
 
-            thick = int(self._spiral_thickness.value())
-            metric = str(self._spiral_metric.currentData() or "euclidean")
-            if thick <= 1 and metric == "chebyshev":
-                p = _corner_fill(p)
-            if thick > 1:
-                rule = ThicknessRule(metric=metric, radius=int(thick - 1))
-                p = _dilate(p, rule=rule)
+            thickness = int(self._spiral_thickness.value())
+            metric_name = str(self._spiral_metric.currentData() or "euclidean")
+            shape_points = _apply_thickness(shape_points, metric=metric_name, thick=thickness)
 
-            for q in p:
-                if q in pts_colored:
-                    pts_colored[q] = QtGui.QColor(185, 210, 120, 225)
+            for point in shape_points:
+                if point in points_colored:
+                    points_colored[point] = QtGui.QColor(185, 210, 120, 225)
                 else:
-                    pts_colored[q] = QtGui.QColor(85, 210, 120, 215)
-            pts_all |= p
+                    points_colored[point] = QtGui.QColor(85, 210, 120, 215)
+            points_all |= shape_points
 
-        return pts_colored, pts_all
+        return points_colored, points_all
 
     def _on_generate(self) -> None:
         try:
-            pts_colored, pts_all = self._compose_points()
-            self._current_points = dict(pts_colored)
+            points_colored, points_all = self._compose_points()
+            self._current_points = dict(points_colored)
 
             self._viewport.set_points(self._current_points)
 
-            y = int(self._y_level.value())
-            coords = sorted(list(pts_all), key=lambda p: (int(p[1]), int(p[0])))
+            y_level = int(self._y_level.value())
+            sorted_coords = sorted(list(points_all), key=lambda p: (int(p[1]), int(p[0])))
 
-            lines = [f"{int(x)} {int(y)} {int(z)}" for x, z in coords]
-            self._txt_coords.setPlainText("\n".join(lines))
+            coord_lines = [f"{int(x)} {int(y_level)} {int(z)}" for x, z in sorted_coords]
+            self._txt_coords.setPlainText("\n".join(coord_lines))
 
-            ascii_map = _points_to_ascii(pts_all, pad=1, on="#", off=".")
-            self._txt_ascii.setPlainText(ascii_map)
+            ascii_text = _points_to_ascii(points_all, pad=1, on="#", off=".")
+            self._txt_ascii.setPlainText(ascii_text)
 
-            self._lbl_status.setText(f"Blocks: {len(coords)}")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Generate failed", str(e))
+            self._lbl_status.setText(f"Blocks: {len(sorted_coords)}")
+        except Exception as error:
+            QtWidgets.QMessageBox.critical(self, "Generate failed", str(error))
 
     def _on_clear(self) -> None:
         self._current_points = {}
@@ -745,31 +902,39 @@ class BuildDesignPlannerMainWindow(QtWidgets.QMainWindow):
         if not self._txt_coords.toPlainText().strip():
             return
 
-        default = (Path.cwd() / "build_coords.txt").resolve()
-        out_path, _filter = QtWidgets.QFileDialog.getSaveFileName(
+        default_path = (Path.cwd() / "build_coords.txt").resolve()
+        output_path, _selected_filter = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save coordinates",
-            str(default),
+            str(default_path),
             "Text (*.txt)",
         )
-        if not out_path:
+        if not output_path:
             return
 
         try:
-            Path(out_path).write_text(self._txt_coords.toPlainText().rstrip() + "\n", encoding="utf-8", newline="\n")
-            self._lbl_status.setText(f"Saved: {out_path}")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
+            Path(output_path).write_text(self._txt_coords.toPlainText().rstrip() + "\n", encoding="utf-8", newline="\n")
+            self._lbl_status.setText(f"Saved: {output_path}")
+        except Exception as error:
+            QtWidgets.QMessageBox.critical(self, "Save failed", str(error))
+
+
+# endregion MAINWIN
+# region ENTRY
+# Application bootstrap: create QApplication, apply theme, show main window
 
 
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
     _apply_dark_theme(app)
-    w = BuildDesignPlannerMainWindow()
-    w.resize(1280, 820)
-    w.show()
+    main_window = BuildDesignPlannerMainWindow()
+    main_window.resize(1280, 820)
+    main_window.show()
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
     main()
+
+
+# endregion ENTRY

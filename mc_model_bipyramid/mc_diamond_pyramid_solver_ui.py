@@ -44,12 +44,14 @@ Usage
     `arborea_1_19_2/src/main/resources/assets/arborea/models/`
 """
 
-import json
+#region SETUP
+# Module imports, PySide6 bootstrap, and core re-exports
+
 import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal, Optional
+from typing import Iterable, Optional
 
 
 def _try_import_pyside6():
@@ -70,259 +72,44 @@ if _imports is None:
 
 QtCore, QtGui, QtWidgets = _imports
 
-Axis = Literal["x", "y", "z"]
-PresetId = Literal["diamond", "pyramid", "mode"]
-PyramidStyle = Literal["short", "tall"]
-PyramidOrientation = Literal["up", "down"]
 
-_ALLOWED_ROTATION_ANGLES = (-45.0, -22.5, 22.5, 45.0)
-_SLOPE_ANGLES = (22.5, 45.0, 67.5)
-
-
-def _snap_to_allowed(v: float, allowed: tuple[float, ...], *, eps: float = 1e-6) -> float:
-    vv = float(v)
-    best = min(allowed, key=lambda a: abs(float(a) - vv))
-    if abs(float(best) - vv) <= float(eps):
-        return float(best)
-    raise ValueError(f"Value {vv:g} not in allowed set: {allowed}")
-
-
-def _slope_to_build_params(*, slope_angle_deg: float) -> tuple[float, PyramidStyle]:
-    s = abs(float(slope_angle_deg))
-    s = _snap_to_allowed(s, _SLOPE_ANGLES)
-    if s > 45.0:
-        rot = 90.0 - s
-        rot = _snap_to_allowed(rot, tuple(abs(a) for a in _ALLOWED_ROTATION_ANGLES))
-        return rot, "tall"
-    return s, "short"
-
-_FAVORED_SIDE_UV_ROTATIONS: dict[tuple[PresetId, int], int] = {
-    ("pyramid", 1): 0,
-    ("pyramid", 2): 180,
-    ("pyramid", 3): 90,
-    ("pyramid", 4): 270,
-    ("diamond", 0): 180,
-    ("diamond", 1): 0,
-    ("diamond", 2): 270,
-    ("diamond", 3): 90,
-    ("diamond", 4): 180,
-    ("diamond", 5): 180,
-    ("diamond", 6): 180,
-    ("diamond", 7): 180,
-}
-
-_TALL_PYRAMID_FACE_UV_ROTATION: dict[str, int] = {
-    "north": 0,
-    "south": 180,
-    "east": 90,
-    "west": 270,
-}
+from mc_diamond_pyramid_solver_core import (
+    Axis,
+    Cuboid,
+    PresetId,
+    PyramidOrientation,
+    PyramidStyle,
+    Rotation,
+    _FAVORED_SIDE_UV_ROTATIONS,
+    _SLOPE_ANGLES,
+    _TALL_PYRAMID_FACE_UV_ROTATION,
+    _apex_height,
+    _atlas_grid_count,
+    _atlas_layout_px,
+    _atlas_uv_rect,
+    _element_for_plane,
+    _face_axes_and_bounds,
+    _faces_for_plane,
+    _fwd_rotate_point,
+    _get_axis_value,
+    _inv_rotate_point,
+    _parse_vec2,
+    _plane_from_face,
+    _plane_side,
+    _point_on_face_unrotated,
+    _snap_to_allowed,
+    _slope_to_build_params,
+    build_mode_planes,
+    build_pyramid_planes,
+    build_unilateral_octahedron_planes,
+    export_minecraft_model,
+    format_minecraft_model_json,
+)
+#endregion
 
 
-def _sin_deg(v: float) -> float:
-    return math.sin(math.radians(v))
-
-
-def _deg_to_rad(deg: float) -> float:
-    return deg * (math.pi / 180.0)
-
-
-def _rot_inv_xyz(*, axis: Axis, angle_deg: float, x: float, y: float, z: float) -> tuple[float, float, float]:
-    if angle_deg == 0.0:
-        return x, y, z
-
-    a = _deg_to_rad(angle_deg)
-    c = math.cos(a)
-    s = math.sin(a)
-
-    if axis == "x":
-        yy = (c * y) + (s * z)
-        zz = (-s * y) + (c * z)
-        return x, yy, zz
-
-    if axis == "y":
-        xx = (c * x) + (s * z)
-        zz = (-s * x) + (c * z)
-        return xx, y, zz
-
-    if axis == "z":
-        xx = (c * x) + (s * y)
-        yy = (-s * x) + (c * y)
-        return xx, yy, z
-
-    raise ValueError(f"Invalid axis: {axis}")
-
-
-def _fwd_rotate_point(*, c: "Cuboid", p: tuple[float, float, float]) -> tuple[float, float, float]:
-    x, y, z = p
-    if c.rotation is None or float(c.rotation.angle) == 0.0:
-        return x, y, z
-
-    ox, oy, oz = c.rotation.origin
-    x -= ox
-    y -= oy
-    z -= oz
-
-    if bool(c.rotation.rescale):
-        a = abs(float(c.rotation.angle))
-        cos_a = math.cos(math.radians(a))
-        if cos_a > 1e-12:
-            s = 1.0 / cos_a
-            if c.rotation.axis == "x":
-                y *= s
-                z *= s
-            elif c.rotation.axis == "y":
-                x *= s
-                z *= s
-            else:
-                x *= s
-                y *= s
-
-    x, y, z = _rot_fwd_xyz(axis=c.rotation.axis, angle_deg=c.rotation.angle, x=x, y=y, z=z)
-    x += ox
-    y += oy
-    z += oz
-    return x, y, z
-
-
-def _point_on_face_unrotated(*, c: "Cuboid", face: str, u: float, v: float) -> tuple[float, float, float]:
-    a_axis, b_axis, amin, amax, bmin, bmax = _face_axes_and_bounds(c=c, face=face)
-    aa = amin + (amax - amin) * float(u)
-    bb = bmin + (bmax - bmin) * float(v)
-
-    fx, fy, fz = c.fr
-    tx, ty, tz = c.to
-    if face == "up":
-        fixed = float(ty)
-        if a_axis == "x":
-            return (aa, fixed, bb)
-        return (bb, fixed, aa)
-    if face == "down":
-        fixed = float(fy)
-        if a_axis == "x":
-            return (aa, fixed, bb)
-        return (bb, fixed, aa)
-    if face == "north":
-        fixed = float(fz)
-        return (aa, bb, fixed)
-    if face == "south":
-        fixed = float(tz)
-        return (aa, bb, fixed)
-    if face == "east":
-        fixed = float(tx)
-        return (fixed, bb, aa)
-    if face == "west":
-        fixed = float(fx)
-        return (fixed, bb, aa)
-    raise ValueError(f"Invalid face: {face}")
-
-
-def _plane_from_face(*, c: "Cuboid", face: str) -> tuple[tuple[float, float, float], float]:
-    fx, fy, fz = c.fr
-    tx, ty, tz = c.to
-
-    if face == "up":
-        p0u = (fx, ty, fz)
-        p1u = (tx, ty, fz)
-        p2u = (fx, ty, tz)
-    elif face == "down":
-        p0u = (fx, fy, fz)
-        p1u = (fx, fy, tz)
-        p2u = (tx, fy, fz)
-    elif face == "north":
-        p0u = (fx, fy, fz)
-        p1u = (tx, fy, fz)
-        p2u = (fx, ty, fz)
-    elif face == "south":
-        p0u = (fx, fy, tz)
-        p1u = (fx, ty, tz)
-        p2u = (tx, fy, tz)
-    elif face == "east":
-        p0u = (tx, fy, fz)
-        p1u = (tx, ty, fz)
-        p2u = (tx, fy, tz)
-    elif face == "west":
-        p0u = (fx, fy, fz)
-        p1u = (fx, fy, tz)
-        p2u = (fx, ty, fz)
-    else:
-        raise ValueError(f"Invalid face: {face}")
-
-    p0 = _fwd_rotate_point(c=c, p=p0u)
-    p1 = _fwd_rotate_point(c=c, p=p1u)
-    p2 = _fwd_rotate_point(c=c, p=p2u)
-
-    ax, ay, az = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
-    bx, by, bz = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
-    nx = (ay * bz) - (az * by)
-    ny = (az * bx) - (ax * bz)
-    nz = (ax * by) - (ay * bx)
-
-    nlen = math.sqrt((nx * nx) + (ny * ny) + (nz * nz))
-    if nlen > 1e-12:
-        inv = 1.0 / nlen
-        nx *= inv
-        ny *= inv
-        nz *= inv
-
-    d = -((nx * p0[0]) + (ny * p0[1]) + (nz * p0[2]))
-    return (nx, ny, nz), float(d)
-
-
-def _plane_side(n: tuple[float, float, float], d: float, p: tuple[float, float, float]) -> float:
-    return (n[0] * p[0]) + (n[1] * p[1]) + (n[2] * p[2]) + float(d)
-
-
-def _rot_fwd_xyz(*, axis: Axis, angle_deg: float, x: float, y: float, z: float) -> tuple[float, float, float]:
-    return _rot_inv_xyz(axis=axis, angle_deg=-float(angle_deg), x=x, y=y, z=z)
-
-
-@dataclass(frozen=True)
-class Rotation:
-    axis: Axis
-    angle: float
-    origin: tuple[float, float, float]
-    rescale: bool = False
-
-
-@dataclass(frozen=True)
-class Cuboid:
-    fr: tuple[float, float, float]
-    to: tuple[float, float, float]
-    rotation: Optional[Rotation]
-
-    def contains_point(self, p: tuple[float, float, float]) -> bool:
-        x, y, z = p
-
-        if self.rotation is not None:
-            ox, oy, oz = self.rotation.origin
-            x -= ox
-            y -= oy
-            z -= oz
-
-            x, y, z = _rot_inv_xyz(axis=self.rotation.axis, angle_deg=self.rotation.angle, x=x, y=y, z=z)
-
-            if bool(self.rotation.rescale):
-                a = abs(float(self.rotation.angle))
-                cos_a = math.cos(math.radians(a))
-                if cos_a > 1e-12:
-                    if self.rotation.axis == "x":
-                        y *= cos_a
-                        z *= cos_a
-                    elif self.rotation.axis == "y":
-                        x *= cos_a
-                        z *= cos_a
-                    else:
-                        x *= cos_a
-                        y *= cos_a
-
-            x += ox
-            y += oy
-            z += oz
-
-        fx, fy, fz = self.fr
-        tx, ty, tz = self.to
-        return (fx <= x <= tx) and (fy <= y <= ty) and (fz <= z <= tz)
+#region THEME
+# Dark Fusion stylesheet for the application window
 
 
 def _apply_dark_theme(app: QtWidgets.QApplication) -> None:
@@ -349,6 +136,12 @@ def _apply_dark_theme(app: QtWidgets.QApplication) -> None:
         "QPushButton#btn_save:hover { border: 1px solid #6a3b90; }"
         "QSplitter::handle { background: #0b0b0d; }"
     )
+#endregion
+
+
+#region VIEWPORT
+# 3D wireframe/face viewport with mouse orbit, depth-sorted polygon fill,
+# UV-debug arrow overlays, and target-wireframe coverage coloring
 
 
 class ModelViewport(QtWidgets.QWidget):
@@ -413,7 +206,6 @@ class ModelViewport(QtWidgets.QWidget):
     ) -> None:
         self._target_enabled = bool(enabled)
         self._target_segments = list(segments)
-        self.update()
         self.update()
 
     def set_uv_debug(self, *, enabled: bool, info: list[tuple[str, Optional[int], str]]) -> None:
@@ -629,6 +421,18 @@ class ModelViewport(QtWidgets.QWidget):
                     (3, 0, 4, 7),
                 )
 
+                _FACE_NAME_BY_IDX = {
+                    (0, 1, 2, 3): "north",
+                    (4, 5, 6, 7): "south",
+                    (0, 1, 5, 4): "down",
+                    (1, 2, 6, 5): "east",
+                    (2, 3, 7, 6): "up",
+                    (3, 0, 4, 7): "west",
+                }
+
+                def face_name_for(quad: tuple[int, int, int, int]) -> str:
+                    return _FACE_NAME_BY_IDX.get(quad, "north")
+
                 for i0, i1, i2, i3 in face_idx:
                     p0 = project_cam(cam_pts[i0])
                     p1 = project_cam(cam_pts[i1])
@@ -664,18 +468,7 @@ class ModelViewport(QtWidgets.QWidget):
                     )
 
                     if self._debug_face_colors:
-                        face_name = "north"
-                        if (i0, i1, i2, i3) == (4, 5, 6, 7):
-                            face_name = "south"
-                        elif (i0, i1, i2, i3) == (0, 1, 5, 4):
-                            face_name = "down"
-                        elif (i0, i1, i2, i3) == (1, 2, 6, 5):
-                            face_name = "east"
-                        elif (i0, i1, i2, i3) == (2, 3, 7, 6):
-                            face_name = "up"
-                        elif (i0, i1, i2, i3) == (3, 0, 4, 7):
-                            face_name = "west"
-
+                        face_name = face_name_for((i0, i1, i2, i3))
                         col = face_debug_cols[face_name]
 
                     poly = QtGui.QPolygonF([p0, p1, p2, p3])
@@ -685,17 +478,7 @@ class ModelViewport(QtWidgets.QWidget):
                     if self._uv_debug_enabled and i_c < len(self._uv_debug_info):
                         outward_face, face_rot, label = self._uv_debug_info[i_c]
 
-                        face_name = "north"
-                        if (i0, i1, i2, i3) == (4, 5, 6, 7):
-                            face_name = "south"
-                        elif (i0, i1, i2, i3) == (0, 1, 5, 4):
-                            face_name = "down"
-                        elif (i0, i1, i2, i3) == (1, 2, 6, 5):
-                            face_name = "east"
-                        elif (i0, i1, i2, i3) == (2, 3, 7, 6):
-                            face_name = "up"
-                        elif (i0, i1, i2, i3) == (3, 0, 4, 7):
-                            face_name = "west"
+                        face_name = face_name_for((i0, i1, i2, i3))
 
                         if str(face_name) == str(outward_face):
                             # Compute face-center and the "texture up" arrow direction in world-space.
@@ -842,120 +625,12 @@ class ModelViewport(QtWidgets.QWidget):
             painter.drawLine(pa, pb)
 
         painter.end()
+#endregion
 
 
-def _parse_vec2(raw: str) -> tuple[float, float]:
-    parts = [p.strip() for p in raw.split(",")]
-    if len(parts) != 2:
-        raise ValueError("Expected x,z")
-    return float(parts[0]), float(parts[1])
-
-
-def _faces_for_plane(*, outward_face: str, double_sided: bool) -> list[str]:
-    if not double_sided:
-        return [outward_face]
-
-    opp = {
-        "north": "south",
-        "south": "north",
-        "east": "west",
-        "west": "east",
-        "up": "down",
-        "down": "up",
-    }[outward_face]
-
-    return [outward_face, opp]
-
-
-def _atlas_grid_count(n: int) -> int:
-    n = max(1, int(n))
-    return int(math.ceil(math.sqrt(float(n))))
-
-
-def _atlas_layout_px(*, n: int, tile_px: int, gap_px: int, total_px: int, border_px: int = 0) -> tuple[int, int, int]:
-    g = _atlas_grid_count(n)
-
-    gap_px = max(0, int(gap_px))
-    border_px = max(0, int(border_px))
-    tile_px = max(1, int(tile_px))
-    total_px = int(total_px)
-
-    if total_px > 0:
-        usable = total_px - (2 * border_px) - ((g - 1) * gap_px)
-        tile_px = max(1, usable // g)
-
-    atlas_px = (g * tile_px) + ((g - 1) * gap_px) + (2 * border_px)
-    return g, tile_px, atlas_px
-
-
-def _atlas_uv_rect(*, index: int, n: int, tile_px: int, gap_px: int, total_px: int, border_px: int = 0) -> list[float]:
-    g, tile_px, atlas_px = _atlas_layout_px(n=n, tile_px=tile_px, gap_px=gap_px, total_px=total_px, border_px=border_px)
-
-    tile_uv = 16.0 * (float(tile_px) / float(atlas_px))
-    gap_uv = 16.0 * (float(max(0, int(gap_px))) / float(atlas_px))
-    border_uv = 16.0 * (float(max(0, int(border_px))) / float(atlas_px))
-
-    ix = int(index) % g
-    iy = int(index) // g
-
-    step = tile_uv + gap_uv
-    u0 = border_uv + float(ix) * step
-    v0 = border_uv + float(iy) * step
-    return [u0, v0, u0 + tile_uv, v0 + tile_uv]
-
-
-def _inv_rotate_point(*, c: Cuboid, p: tuple[float, float, float]) -> tuple[float, float, float]:
-    x, y, z = p
-    if c.rotation is None or float(c.rotation.angle) == 0.0:
-        return x, y, z
-
-    ox, oy, oz = c.rotation.origin
-    x -= ox
-    y -= oy
-    z -= oz
-    x, y, z = _rot_inv_xyz(axis=c.rotation.axis, angle_deg=c.rotation.angle, x=x, y=y, z=z)
-
-    if bool(c.rotation.rescale):
-        a = abs(float(c.rotation.angle))
-        cos_a = math.cos(math.radians(a))
-        if cos_a > 1e-12:
-            if c.rotation.axis == "x":
-                y *= cos_a
-                z *= cos_a
-            elif c.rotation.axis == "y":
-                x *= cos_a
-                z *= cos_a
-            else:
-                x *= cos_a
-                y *= cos_a
-
-    x += ox
-    y += oy
-    z += oz
-    return x, y, z
-
-
-def _face_axes_and_bounds(*, c: Cuboid, face: str) -> tuple[str, str, float, float, float, float]:
-    fx, fy, fz = c.fr
-    tx, ty, tz = c.to
-
-    if face == "up" or face == "down":
-        return "x", "z", float(fx), float(tx), float(fz), float(tz)
-    if face == "north" or face == "south":
-        return "x", "y", float(fx), float(tx), float(fy), float(ty)
-    if face == "east" or face == "west":
-        return "z", "y", float(fz), float(tz), float(fy), float(ty)
-    raise ValueError(f"Invalid face: {face}")
-
-
-def _get_axis_value(axis: str, p: tuple[float, float, float]) -> float:
-    if axis == "x":
-        return float(p[0])
-    if axis == "y":
-        return float(p[1])
-    if axis == "z":
-        return float(p[2])
-    raise ValueError(f"Invalid axis: {axis}")
+#region ATLASGEN
+# Cutout atlas PNG generation: rasterizes per-plane alpha masks for pyramid
+# ramps and triangle cutouts for diamond/mode presets into a QImage grid
 
 
 def _make_cutout_atlas_image(
@@ -991,13 +666,6 @@ def _make_cutout_atlas_image(
     p.setPen(QtCore.Qt.PenStyle.NoPen)
     p.setBrush(QtGui.QBrush(QtGui.QColor(255, 255, 255, 255)))
 
-    def apex_height(half: float, slope_angle_deg: float) -> float:
-        a = abs(float(slope_angle_deg))
-        t = math.tan(math.radians(a))
-        if t <= 1e-9:
-            return 0.0
-        return float(half) * t
-
     cx, cz = center_xz
 
     def _tex_from_face_uv(u: float, v: float, rot_deg: Optional[int]) -> tuple[float, float]:
@@ -1026,7 +694,7 @@ def _make_cutout_atlas_image(
 
     def pyramid_face_triangle(idx: int) -> Optional[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]]:
         base_y = float(join_y)
-        h0 = apex_height(half_base, top_angle)
+        h0 = _apex_height(half_base, top_angle)
         apex_y = (base_y + h0) if pyramid_orientation == "up" else (base_y - h0)
         apex = (cx, apex_y, cz)
         nw = (cx - half_base, base_y, cz - half_base)
@@ -1047,8 +715,8 @@ def _make_cutout_atlas_image(
 
     def diamond_face_triangle(idx: int) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
         jy = float(join_y)
-        th = apex_height(half_base, top_angle)
-        bh = apex_height(half_base, bottom_angle)
+        th = _apex_height(half_base, top_angle)
+        bh = _apex_height(half_base, bottom_angle)
         top_apex = (cx, jy + th, cz)
         bot_apex = (cx, jy - bh, cz)
         nw = (cx - half_base, jy, cz - half_base)
@@ -1080,8 +748,8 @@ def _make_cutout_atlas_image(
         bottom_slope: float,
         idx: int,
     ) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
-        th = apex_height(half_base, top_slope)
-        bh = apex_height(half_base, bottom_slope)
+        th = _apex_height(half_base, top_slope)
+        bh = _apex_height(half_base, bottom_slope)
         top_apex = (cx, jy + th, cz)
         bot_apex = (cx, jy - bh, cz)
         nw = (cx - half_base, jy, cz - half_base)
@@ -1121,7 +789,7 @@ def _make_cutout_atlas_image(
         top2_slope = 45.0
         bot2_slope = 67.5
 
-        join_y2 = float(join_y) - apex_height(half_base, bot1_slope) - apex_height(half_base, top2_slope)
+        join_y2 = float(join_y) - _apex_height(half_base, bot1_slope) - _apex_height(half_base, top2_slope)
         grp = 0 if ii < 8 else 1
         local = ii % 8
         if grp == 0:
@@ -1132,7 +800,7 @@ def _make_cutout_atlas_image(
     pyr_inside: Optional[tuple[float, float, float]] = None
     if preset == "pyramid" and len(planes) >= 5:
         base_y = float(join_y)
-        h0 = apex_height(half_base, top_angle)
+        h0 = _apex_height(half_base, top_angle)
         if pyramid_orientation == "up":
             pyr_inside = (float(cx), float(base_y) + (float(h0) * 0.35), float(cz))
         else:
@@ -1313,384 +981,12 @@ def _make_cutout_atlas_image(
 
     p.end()
     return img
+#endregion
 
 
-def _element_for_plane(
-    *,
-    cuboid: Cuboid,
-    texture_key: str,
-    outward_face: str,
-    double_sided: bool,
-    force_full_uv: bool,
-    uv: Optional[list[float]] = None,
-    face_rotation: Optional[int] = None,
-    shade: bool,
-) -> dict:
-    faces: dict = {}
-    for f in _faces_for_plane(outward_face=outward_face, double_sided=double_sided):
-        d = {"texture": texture_key}
-        if uv is not None:
-            d["uv"] = list(uv)
-        elif force_full_uv:
-            d["uv"] = [0.0, 0.0, 16.0, 16.0]
-        r = None if face_rotation is None else int(face_rotation)
-        if r in (0, 90, 180, 270) and int(r) != 0:
-            d["rotation"] = int(r)
-        faces[f] = d
-
-    el: dict = {
-        "from": [cuboid.fr[0], cuboid.fr[1], cuboid.fr[2]],
-        "to": [cuboid.to[0], cuboid.to[1], cuboid.to[2]],
-        "faces": faces,
-    }
-
-    if not shade:
-        el["shade"] = False
-
-    if cuboid.rotation is not None and float(cuboid.rotation.angle) != 0.0:
-        rot: dict = {
-            "origin": [cuboid.rotation.origin[0], cuboid.rotation.origin[1], cuboid.rotation.origin[2]],
-            "axis": cuboid.rotation.axis,
-            "angle": cuboid.rotation.angle,
-        }
-        if bool(cuboid.rotation.rescale):
-            rot["rescale"] = True
-        el["rotation"] = rot
-
-    return el
-
-
-def export_minecraft_model(*, elements: list[dict], textures: dict, particle: Optional[str] = None) -> dict:
-    if particle is None:
-        particle = str(textures.get("0", "minecraft:block/oak_planks"))
-
-    out = {
-        "textures": dict(textures),
-        "elements": list(elements),
-    }
-    if "particle" not in out["textures"]:
-        out["textures"]["particle"] = particle
-    return out
-
-
-def build_mode_planes(
-    *,
-    center_xz: tuple[float, float],
-    join_y: float,
-    half_base: float,
-    thickness: float,
-    rescale: bool,
-) -> list[tuple[Cuboid, str]]:
-    def apex_height(half: float, slope_angle_deg: float) -> float:
-        a = abs(float(slope_angle_deg))
-        t = math.tan(math.radians(a))
-        if t <= 1e-9:
-            return 0.0
-        return float(half) * t
-
-    top1_slope = 67.5
-    bot1_slope = 45.0
-    top2_slope = 45.0
-    bot2_slope = 67.5
-
-    top1_rot, top1_style = _slope_to_build_params(slope_angle_deg=top1_slope)
-    bot1_rot, bot1_style = _slope_to_build_params(slope_angle_deg=bot1_slope)
-    top2_rot, top2_style = _slope_to_build_params(slope_angle_deg=top2_slope)
-    bot2_rot, bot2_style = _slope_to_build_params(slope_angle_deg=bot2_slope)
-
-    # Stack the second bipyramid below the first, tip-to-tip.
-    join_y2 = float(join_y) - apex_height(half_base, bot1_slope) - apex_height(half_base, top2_slope)
-
-    a = build_unilateral_octahedron_planes(
-        center_xz=center_xz,
-        join_y=float(join_y),
-        half_base=half_base,
-        top_angle_deg=top1_rot,
-        bottom_angle_deg=bot1_rot,
-        top_style=top1_style,
-        bottom_style=bot1_style,
-        thickness=thickness,
-        rescale=rescale,
-    )
-    b = build_unilateral_octahedron_planes(
-        center_xz=center_xz,
-        join_y=float(join_y2),
-        half_base=half_base,
-        top_angle_deg=top2_rot,
-        bottom_angle_deg=bot2_rot,
-        top_style=top2_style,
-        bottom_style=bot2_style,
-        thickness=thickness,
-        rescale=rescale,
-    )
-    return list(a) + list(b)
-
-
-def build_pyramid_planes(
-    *,
-    center_xz: tuple[float, float],
-    base_y: float,
-    half_base: float,
-    angle_deg: float,
-    thickness: float,
-    rescale: bool,
-    style: PyramidStyle = "short",
-    orientation: PyramidOrientation = "up",
-    include_base: bool = True,
-) -> list[tuple[Cuboid, str]]:
-    cx, cz = center_xz
-
-    angle_deg = _snap_to_allowed(float(angle_deg), tuple(abs(a) for a in _ALLOWED_ROTATION_ANGLES))
-
-    a = abs(float(angle_deg))
-    t = float(thickness)
-    if t <= 0.0:
-        raise ValueError("Thickness must be > 0")
-
-    tan_a = math.tan(math.radians(a))
-    if tan_a <= 1e-9:
-        raise ValueError("Angle too small")
-
-    height_short = float(half_base) * float(tan_a)
-    height_tall = float(half_base) / float(tan_a)
-
-    height = float(height_short) if style != "tall" else float(height_tall)
-    apex_y = float(base_y) + float(height)
-
-    cos_a = math.cos(math.radians(a))
-    if cos_a <= 1e-9:
-        raise ValueError("Angle too steep")
-
-    run = float(half_base) / float(cos_a)
-
-    x0 = cx - float(half_base)
-    x1 = cx + float(half_base)
-    z0 = cz - float(half_base)
-    z1 = cz + float(half_base)
-
-    out: list[tuple[Cuboid, str]] = []
-
-    # Base plane
-    base = Cuboid(
-        fr=(x0, float(base_y) - t * 0.5, z0),
-        to=(x1, float(base_y) + t * 0.5, z1),
-        rotation=None,
-    )
-    out.append((base, "down"))
-
-    if style == "tall":
-        z_n = cz - float(half_base)
-        z_s = cz + float(half_base)
-        x_w = cx - float(half_base)
-        x_e = cx + float(half_base)
-
-        h_pre = float(half_base) / max(1e-9, math.sin(math.radians(a)))
-
-        c_s = Cuboid(
-            fr=(x0, float(base_y), z_s - t * 0.5),
-            to=(x1, float(base_y) + h_pre, z_s + t * 0.5),
-            rotation=Rotation(axis="x", angle=-a, origin=(cx, float(base_y), z_s), rescale=rescale),
-        )
-        out.append((c_s, "south"))
-
-        c_n = Cuboid(
-            fr=(x0, float(base_y), z_n - t * 0.5),
-            to=(x1, float(base_y) + h_pre, z_n + t * 0.5),
-            rotation=Rotation(axis="x", angle=a, origin=(cx, float(base_y), z_n), rescale=rescale),
-        )
-        out.append((c_n, "north"))
-
-        c_e = Cuboid(
-            fr=(x_e - t * 0.5, float(base_y), z0),
-            to=(x_e + t * 0.5, float(base_y) + h_pre, z1),
-            rotation=Rotation(axis="z", angle=a, origin=(x_e, float(base_y), cz), rescale=rescale),
-        )
-        out.append((c_e, "east"))
-
-        c_w = Cuboid(
-            fr=(x_w - t * 0.5, float(base_y), z0),
-            to=(x_w + t * 0.5, float(base_y) + h_pre, z1),
-            rotation=Rotation(axis="z", angle=-a, origin=(x_w, float(base_y), cz), rescale=rescale),
-        )
-        out.append((c_w, "west"))
-    else:
-        apex = (cx, apex_y, cz)
-
-        c_s = Cuboid(
-            fr=(x0, apex_y, cz - t * 0.5),
-            to=(x1, apex_y + t, cz + run + t * 0.5),
-            rotation=Rotation(axis="x", angle=a, origin=apex, rescale=rescale),
-        )
-        out.append((c_s, "up"))
-
-        c_n = Cuboid(
-            fr=(x0, apex_y, cz - run - t * 0.5),
-            to=(x1, apex_y + t, cz + t * 0.5),
-            rotation=Rotation(axis="x", angle=-a, origin=apex, rescale=rescale),
-        )
-        out.append((c_n, "up"))
-
-        c_e = Cuboid(
-            fr=(cx - t * 0.5, apex_y, z0),
-            to=(cx + run + t * 0.5, apex_y + t, z1),
-            rotation=Rotation(axis="z", angle=-a, origin=apex, rescale=rescale),
-        )
-        out.append((c_e, "up"))
-
-        c_w = Cuboid(
-            fr=(cx - run - t * 0.5, apex_y, z0),
-            to=(cx + t * 0.5, apex_y + t, z1),
-            rotation=Rotation(axis="z", angle=a, origin=apex, rescale=rescale),
-        )
-        out.append((c_w, "up"))
-
-    if not bool(include_base):
-        out = out[1:]
-
-    if orientation == "down":
-        def flip_face(f: str) -> str:
-            if f == "up":
-                return "down"
-            if f == "down":
-                return "up"
-            return f
-
-        def flip_cub(c: Cuboid) -> Cuboid:
-            fx, fy, fz = c.fr
-            tx, ty, tz = c.to
-            fy2 = (2.0 * float(base_y)) - float(fy)
-            ty2 = (2.0 * float(base_y)) - float(ty)
-            fr2 = (float(fx), min(fy2, ty2), float(fz))
-            to2 = (float(tx), max(fy2, ty2), float(tz))
-
-            rot2: Optional[Rotation] = None
-            if c.rotation is not None:
-                ox, oy, oz = c.rotation.origin
-                oy2 = (2.0 * float(base_y)) - float(oy)
-                ang = float(c.rotation.angle)
-                if c.rotation.axis in ("x", "z"):
-                    ang = -ang
-                rot2 = Rotation(axis=c.rotation.axis, angle=ang, origin=(float(ox), float(oy2), float(oz)), rescale=bool(c.rotation.rescale))
-
-            return Cuboid(fr=fr2, to=to2, rotation=rot2)
-
-        out = [(flip_cub(c), flip_face(f)) for (c, f) in out]
-
-    return out
-
-
-def format_minecraft_model_json(model: dict) -> str:
-    def is_scalar(v) -> bool:
-        return v is None or isinstance(v, (str, int, float, bool))
-
-    def try_inline(obj) -> Optional[str]:
-        if isinstance(obj, list):
-            if all(is_scalar(x) for x in obj) and len(obj) <= 16:
-                s = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-                if len(s) <= 80:
-                    return s
-            return None
-
-        if isinstance(obj, dict):
-            if all(isinstance(k, str) for k in obj.keys()):
-                ok = True
-                for v in obj.values():
-                    if is_scalar(v):
-                        continue
-                    if isinstance(v, list) and all(is_scalar(x) for x in v) and len(v) <= 16:
-                        continue
-                    if isinstance(v, dict) and all(isinstance(kk, str) for kk in v.keys()) and all(
-                        is_scalar(vv) for vv in v.values()
-                    ):
-                        continue
-                    ok = False
-                    break
-                if ok:
-                    s = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-                    if len(s) <= 80:
-                        return s
-            return None
-
-        if is_scalar(obj):
-            return json.dumps(obj, ensure_ascii=False)
-
-        return None
-
-    def fmt(obj, level: int) -> str:
-        inline = try_inline(obj)
-        if inline is not None:
-            return inline
-
-        ind = "  " * level
-        ind2 = "  " * (level + 1)
-
-        if isinstance(obj, list):
-            if not obj:
-                return "[]"
-            parts = []
-            for item in obj:
-                parts.append(f"{ind2}{fmt(item, level + 1)}")
-            return "[\n" + ",\n".join(parts) + f"\n{ind}]"
-
-        if isinstance(obj, dict):
-            if not obj:
-                return "{}"
-            parts = []
-            for k, v in obj.items():
-                ks = json.dumps(k, ensure_ascii=False)
-                vs = fmt(v, level + 1)
-                if "\n" in vs:
-                    vs = "\n".join([vs.split("\n", 1)[0]] + [ind2 + line for line in vs.split("\n")[1:]])
-                parts.append(f"{ind2}{ks}: {vs}")
-            return "{\n" + ",\n".join(parts) + f"\n{ind}}}"
-
-        return json.dumps(obj, ensure_ascii=False)
-
-    return fmt(model, 0)
-
-
-def build_unilateral_octahedron_planes(
-    *,
-    center_xz: tuple[float, float],
-    join_y: float,
-    half_base: float,
-    top_angle_deg: float,
-    bottom_angle_deg: float,
-    top_style: PyramidStyle = "short",
-    bottom_style: PyramidStyle = "short",
-    thickness: float,
-    rescale: bool,
-) -> list[tuple[Cuboid, str]]:
-    top = build_pyramid_planes(
-        center_xz=center_xz,
-        base_y=join_y,
-        half_base=half_base,
-        angle_deg=top_angle_deg,
-        thickness=thickness,
-        rescale=rescale,
-        style=top_style,
-        orientation="up",
-        include_base=False,
-    )
-    bot = build_pyramid_planes(
-        center_xz=center_xz,
-        base_y=join_y,
-        half_base=half_base,
-        angle_deg=bottom_angle_deg,
-        thickness=thickness,
-        rescale=rescale,
-        style=bottom_style,
-        orientation="down",
-        include_base=False,
-    )
-
-    if len(top) != 4 or len(bot) != 4:
-        raise ValueError("Internal error building bipyramid")
-
-    # build_pyramid_planes ramp order: south, north, east, west
-    # desired plane order: top_north, top_south, top_west, top_east, bottom_north, bottom_south, bottom_west, bottom_east
-    out = [top[1], top[0], top[3], top[2], bot[1], bot[0], bot[3], bot[2]]
-    return out
+#region WINDOW
+# UiState dataclass and DiamondPyramidMainWindow: the main application window
+# with preset controls, plane list, viewport, output tabs, and save handlers
 
 
 @dataclass
@@ -1898,18 +1194,11 @@ class DiamondPyramidMainWindow(QtWidgets.QMainWindow):
 
         preset, center_xz, join_y, half_base, top_angle, bottom_angle, pyr_style, pyr_orient = params
 
-        def apex_height(half: float, slope_angle_deg: float) -> float:
-            a = abs(float(slope_angle_deg))
-            t = math.tan(math.radians(a))
-            if t <= 1e-9:
-                return 0.0
-            return float(half) * t
-
         cx, cz = center_xz
 
         if preset == "pyramid":
             base_y = float(join_y)
-            h = apex_height(half_base, top_angle)
+            h = _apex_height(half_base, top_angle)
             apex = (cx, (base_y + h) if pyr_orient == "up" else (base_y - h), cz)
 
             nw = (cx - half_base, base_y, cz - half_base)
@@ -1927,8 +1216,8 @@ class DiamondPyramidMainWindow(QtWidgets.QMainWindow):
             ]
         elif preset == "mode":
             def face_set_for(join_y0: float, top_slope0: float, bot_slope0: float) -> list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]]:
-                top_h0 = apex_height(half_base, top_slope0)
-                bot_h0 = apex_height(half_base, bot_slope0)
+                top_h0 = _apex_height(half_base, top_slope0)
+                bot_h0 = _apex_height(half_base, bot_slope0)
                 top_apex0 = (cx, join_y0 + top_h0, cz)
                 bot_apex0 = (cx, join_y0 - bot_h0, cz)
                 nw0 = (cx - half_base, join_y0, cz - half_base)
@@ -1947,13 +1236,13 @@ class DiamondPyramidMainWindow(QtWidgets.QMainWindow):
                 ]
 
             join_a = float(join_y)
-            join_b = float(join_y) - apex_height(half_base, 45.0) - apex_height(half_base, 45.0)
+            join_b = float(join_y) - _apex_height(half_base, 45.0) - _apex_height(half_base, 45.0)
             faces = []
             faces += face_set_for(join_a, 67.5, 45.0)
             faces += face_set_for(join_b, 45.0, 67.5)
         else:
-            top_h = apex_height(half_base, top_angle)
-            bot_h = apex_height(half_base, bottom_angle)
+            top_h = _apex_height(half_base, top_angle)
+            bot_h = _apex_height(half_base, bottom_angle)
 
             top_apex = (cx, join_y + top_h, cz)
             bot_apex = (cx, join_y - bot_h, cz)
@@ -2579,15 +1868,8 @@ class DiamondPyramidMainWindow(QtWidgets.QMainWindow):
             self._txt_elements.setPlainText("\n".join(lines))
             self._txt_model_json.setPlainText(format_minecraft_model_json(model))
 
-            def apex_height(half: float, angle_deg: float) -> float:
-                a = abs(float(angle_deg))
-                t = math.tan(math.radians(a))
-                if t <= 1e-9:
-                    return 0.0
-                return float(half) * t
-
-            top_h = apex_height(half_base, top_slope)
-            bot_h = apex_height(half_base, bottom_slope)
+            top_h = _apex_height(half_base, top_slope)
+            bot_h = _apex_height(half_base, bottom_slope)
             if self._preset == "pyramid":
                 self._last_target_params = (
                     self._preset,
@@ -2607,10 +1889,10 @@ class DiamondPyramidMainWindow(QtWidgets.QMainWindow):
                     )
                 self._lbl_status.setText(f"Generated {len(cuboids)} planes | apex_height={top_h:g}{extra}")
             elif self._preset == "mode":
-                h_a_top = apex_height(half_base, 67.5)
-                h_a_bot = apex_height(half_base, 45.0)
-                h_b_top = apex_height(half_base, 45.0)
-                h_b_bot = apex_height(half_base, 67.5)
+                h_a_top = _apex_height(half_base, 67.5)
+                h_a_bot = _apex_height(half_base, 45.0)
+                h_b_top = _apex_height(half_base, 45.0)
+                h_b_bot = _apex_height(half_base, 67.5)
                 self._last_target_params = (self._preset, center_xz, join_y, half_base, top_slope, bottom_slope, "short", "up")
                 self._sync_target_wireframe()
                 extra = ""
@@ -2673,6 +1955,11 @@ class DiamondPyramidMainWindow(QtWidgets.QMainWindow):
 
         Path(out_path).write_text(format_minecraft_model_json(model) + "\n", encoding="utf-8", newline="\n")
         self._lbl_status.setText(f"Saved: {out_path}")
+#endregion
+
+
+#region ENTRY
+# Application bootstrap: create QApplication, apply theme, show main window
 
 
 def main() -> None:
@@ -2682,6 +1969,7 @@ def main() -> None:
     w.resize(1200, 780)
     w.show()
     sys.exit(app.exec())
+#endregion
 
 
 if __name__ == "__main__":

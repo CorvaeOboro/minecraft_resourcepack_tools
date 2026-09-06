@@ -1,9 +1,18 @@
+"""Spiral and double-spiral generator for procedural Minecraft models.
+
+Generates Archimedean spirals (linear radius interpolation from outer to
+inner) as a list of Cuboid elements, with optional chord-direction rotation,
+auto-merge of collinear segments, and a 4-way radial arrangement mode.
+This module is headless (no PySide6 dependency).
+"""
+
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 from typing import Optional
 
+# region IMPORTS
 from mc_model_procedural_gen_common import (
     Plane,
     _apply_depth_stagger,
@@ -21,12 +30,14 @@ from mc_model_procedural_gen_common import (
 )
 
 try:
-    from mc_model_solver_ui import Cuboid, Rotation
-except Exception as e:
-    print(f"Missing dependency: mc_model_solver_ui.py ({e})")
+    from mc_model_solver_core import Cuboid, Rotation
+except Exception as exc:
+    print(f"Missing dependency: mc_model_solver_core.py ({exc})")
     raise
+# endregion
 
 
+# region DATA
 @dataclass(frozen=True)
 class SpiralConfig:
     center: tuple[float, float, float]
@@ -80,11 +91,13 @@ SPIRAL_UI_SPECS: dict[str, dict] = {
     "max_chord_step": {"type": "double", "min": 0.0, "max": 64.0, "value": 0.75, "decimals": 3},
     "merge_max_dev": {"type": "double", "min": 0.0, "max": 64.0, "value": 0.15, "decimals": 3},
 }
+# endregion
 
 
+# region GENERATE
 def generate_shape(cfg: SpiralConfig, shape: str, *, phase_offset_rad: float = 0.0) -> list[Cuboid]:
-    s = str(shape)
-    if s == "double_spiral":
+    shape_str = str(shape)
+    if shape_str == "double_spiral":
         return generate_double_spiral(cfg, phase_offset_rad=float(phase_offset_rad))
     return generate_spiral(cfg, phase_offset_rad=float(phase_offset_rad))
 
@@ -97,18 +110,18 @@ def generate_spiral(cfg: SpiralConfig, *, phase_offset_rad: float = 0.0) -> list
 
     out: list[Cuboid] = []
 
-    def spiral_point(t: float) -> tuple[float, float, float, float, float]:
-        tt = max(0.0, min(1.0, float(t)))
-        a = ((2.0 * math.pi) * float(cfg.turns) * tt) + float(phase_offset_rad) + math.radians(float(cfg.guide_rotation_deg))
-        r = _lerp(float(cfg.radius_outer), float(cfg.radius_inner), tt)
-        r = max(0.0, float(r))
+    def spiral_point(t_param: float) -> tuple[float, float, float, float, float]:
+        tt = max(0.0, min(1.0, float(t_param)))
+        angle_rad = ((2.0 * math.pi) * float(cfg.turns) * tt) + float(phase_offset_rad) + math.radians(float(cfg.guide_rotation_deg))
+        radius_val = _lerp(float(cfg.radius_outer), float(cfg.radius_inner), tt)
+        radius_val = max(0.0, float(radius_val))
 
         ramp = float(cfg.ramp_height)
         along = (tt * ramp) - (ramp * 0.5)
 
-        p0 = r * math.cos(a)
-        p1 = r * math.sin(a)
-        return tt, a, along, p0, p1
+        px = radius_val * math.cos(angle_rad)
+        py = radius_val * math.sin(angle_rad)
+        return tt, angle_rad, along, px, py
 
     def build_element(*, center: tuple[float, float, float], width: float, thick: float, tlen: float, rot_axis: str, rot_angle: float, swap: bool) -> Optional[Cuboid]:
         x, y, z = (float(center[0]), float(center[1]), float(center[2]))
@@ -151,29 +164,29 @@ def generate_spiral(cfg: SpiralConfig, *, phase_offset_rad: float = 0.0) -> list
             rot = Rotation(axis=str(rot_axis), angle=float(rot_angle), origin=(float(ox), float(oy), float(oz)))
         return Cuboid(fr=fr, to=to, rotation=rot)
 
-    def to_world(tt: float, along: float, p0: float, p1: float) -> tuple[float, float, float]:
+    def to_world(tt: float, along: float, px: float, py: float) -> tuple[float, float, float]:
         if plane == "XZ":
-            return (cx + p0, cy + along, cz + p1)
+            return (cx + px, cy + along, cz + py)
         if plane == "XY":
-            return (cx + p0, cy + p1, cz + along)
-        return (cx + along, cy + p0, cz + p1)
+            return (cx + px, cy + py, cz + along)
+        return (cx + along, cy + px, cz + py)
 
-    def to_plane(v: tuple[float, float, float]) -> tuple[float, float]:
+    def to_plane(pt: tuple[float, float, float]) -> tuple[float, float]:
         if plane == "XZ":
-            return (float(v[0]), float(v[2]))
+            return (float(pt[0]), float(pt[2]))
         if plane == "XY":
-            return (float(v[0]), float(v[1]))
-        return (float(v[1]), float(v[2]))
+            return (float(pt[0]), float(pt[1]))
+        return (float(pt[1]), float(pt[2]))
 
-    def seg_len_plane(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
-        ax, ay = to_plane(a)
-        bx, by = to_plane(b)
+    def seg_len_plane(pt_a: tuple[float, float, float], pt_b: tuple[float, float, float]) -> float:
+        ax, ay = to_plane(pt_a)
+        bx, by = to_plane(pt_b)
         return math.hypot(float(bx - ax), float(by - ay))
 
-    def point_seg_dist_plane(p: tuple[float, float, float], a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
-        px, py = to_plane(p)
-        ax, ay = to_plane(a)
-        bx, by = to_plane(b)
+    def point_seg_dist_plane(pt: tuple[float, float, float], pt_a: tuple[float, float, float], pt_b: tuple[float, float, float]) -> float:
+        px, py = to_plane(pt)
+        ax, ay = to_plane(pt_a)
+        bx, by = to_plane(pt_b)
         abx = float(bx - ax)
         aby = float(by - ay)
         apx = float(px - ax)
@@ -181,10 +194,10 @@ def generate_spiral(cfg: SpiralConfig, *, phase_offset_rad: float = 0.0) -> list
         denom = (abx * abx) + (aby * aby)
         if denom <= 1e-12:
             return math.hypot(float(px - ax), float(py - ay))
-        t = (apx * abx + apy * aby) / denom
-        t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else float(t)
-        cx2 = float(ax) + abx * t
-        cy2 = float(ay) + aby * t
+        t_proj = (apx * abx + apy * aby) / denom
+        t_proj = 0.0 if t_proj < 0.0 else 1.0 if t_proj > 1.0 else float(t_proj)
+        cx2 = float(ax) + abx * t_proj
+        cy2 = float(ay) + aby * t_proj
         return math.hypot(float(px - cx2), float(py - cy2))
 
     if cfg.chord_direction and segs > 1:
@@ -213,9 +226,9 @@ def generate_spiral(cfg: SpiralConfig, *, phase_offset_rad: float = 0.0) -> list
                 return
             center = ((group_start[0] + group_end[0]) * 0.5, (group_start[1] + group_end[1]) * 0.5, (group_start[2] + group_end[2]) * 0.5)
             tlen2 = seg_len_plane(group_start, group_end)
-            el = build_element(center=center, width=group_width, thick=group_thick, tlen=tlen2, rot_axis=group_rot_axis, rot_angle=group_rot_angle, swap=group_swap)
-            if el is not None:
-                out.append(el)
+            elem = build_element(center=center, width=group_width, thick=group_thick, tlen=tlen2, rot_axis=group_rot_axis, rot_angle=group_rot_angle, swap=group_swap)
+            if elem is not None:
+                out.append(elem)
             group_start = None
             group_end = None
 
@@ -226,53 +239,53 @@ def generate_spiral(cfg: SpiralConfig, *, phase_offset_rad: float = 0.0) -> list
         if max_step > 0.0:
             refined: list[float] = [float(t_breaks[0])]
             for i in range(len(t_breaks) - 1):
-                ta = float(t_breaks[i])
-                tb = float(t_breaks[i + 1])
-                _tta, _aa, along_a, p0_a, p1_a = spiral_point(ta)
-                _ttb, _ab, along_b, p0_b, p1_b = spiral_point(tb)
-                wa = to_world(_tta, along_a, p0_a, p1_a)
-                wb = to_world(_ttb, along_b, p0_b, p1_b)
-                L = seg_len_plane(wa, wb)
-                n = int(max(1.0, math.ceil(float(L) / float(max_step))))
-                for k in range(1, n + 1):
-                    refined.append(ta + (tb - ta) * (float(k) / float(n)))
+                t_start = float(t_breaks[i])
+                t_end = float(t_breaks[i + 1])
+                _tt_a, _angle_a, along_a, px_a, py_a = spiral_point(t_start)
+                _tt_b, _angle_b, along_b, px_b, py_b = spiral_point(t_end)
+                world_a = to_world(_tt_a, along_a, px_a, py_a)
+                world_b = to_world(_tt_b, along_b, px_b, py_b)
+                chord_len = seg_len_plane(world_a, world_b)
+                sub_count = int(max(1.0, math.ceil(float(chord_len) / float(max_step))))
+                for sub_idx in range(1, sub_count + 1):
+                    refined.append(t_start + (t_end - t_start) * (float(sub_idx) / float(sub_count)))
             t_breaks = refined
 
         for i in range(len(t_breaks) - 1):
             t0 = float(t_breaks[i])
             t1 = float(t_breaks[i + 1])
-            tm = (t0 + t1) * 0.5
+            t_mid = (t0 + t1) * 0.5
 
-            tt, _a, along, _p0, _p1 = spiral_point(tm)
+            tt, _angle, along, _px, _py = spiral_point(t_mid)
             width = _lerp(float(cfg.width_outer), float(cfg.width_inner), tt)
             width = max(0.01, float(width))
             thick = max(0.01, float(cfg.axis_thickness))
 
-            _tt0, _a0, along0, p00, p01 = spiral_point(t0)
-            _tt1, _a1, along1, p10, p11 = spiral_point(t1)
+            _tt0, _angle0, along0, px00, py01 = spiral_point(t0)
+            _tt1, _angle1, along1, px10, py11 = spiral_point(t1)
 
             if plane == "XZ":
-                s0 = (cx + p00, cy + along0, cz + p01)
-                s1 = (cx + p10, cy + along1, cz + p11)
-                dir_deg = _canonical_direction_deg(math.degrees(math.atan2(float(s1[2] - s0[2]), float(s1[0] - s0[0]))))
+                world0 = (cx + px00, cy + along0, cz + py01)
+                world1 = (cx + px10, cy + along1, cz + py11)
+                dir_deg = _canonical_direction_deg(math.degrees(math.atan2(float(world1[2] - world0[2]), float(world1[0] - world0[0]))))
                 rot_in = -float(dir_deg)
                 if cfg.reverse_rotation:
                     rot_in = -float(rot_in)
                 swap, reduced = _reduce_to_limited_rotation(rot_in)
                 rot_axis = "y"
             elif plane == "XY":
-                s0 = (cx + p00, cy + p01, cz + along0)
-                s1 = (cx + p10, cy + p11, cz + along1)
-                dir_deg = _canonical_direction_deg(math.degrees(math.atan2(float(s1[1] - s0[1]), float(s1[0] - s0[0]))))
+                world0 = (cx + px00, cy + py01, cz + along0)
+                world1 = (cx + px10, cy + py11, cz + along1)
+                dir_deg = _canonical_direction_deg(math.degrees(math.atan2(float(world1[1] - world0[1]), float(world1[0] - world0[0]))))
                 rot_in = float(dir_deg)
                 if cfg.reverse_rotation:
                     rot_in = -float(rot_in)
                 swap, reduced = _reduce_to_limited_rotation(rot_in)
                 rot_axis = "z"
             else:
-                s0 = (cx + along0, cy + p00, cz + p01)
-                s1 = (cx + along1, cy + p10, cz + p11)
-                dir_deg = _canonical_direction_deg(math.degrees(math.atan2(float(s1[2] - s0[2]), float(s1[1] - s0[1]))))
+                world0 = (cx + along0, cy + px00, cz + py01)
+                world1 = (cx + along1, cy + px10, cz + py11)
+                dir_deg = _canonical_direction_deg(math.degrees(math.atan2(float(world1[2] - world0[2]), float(world1[1] - world0[1]))))
                 rot_in = float(dir_deg)
                 if cfg.reverse_rotation:
                     rot_in = -float(rot_in)
@@ -289,20 +302,20 @@ def generate_spiral(cfg: SpiralConfig, *, phase_offset_rad: float = 0.0) -> list
                     can_merge = False
 
             if can_merge and merge_max_dev > 0.0:
-                tm2 = (float(group_t0) + float(t1)) * 0.5
-                _ttm, _am, along_m, p0_m, p1_m = spiral_point(tm2)
-                pm = to_world(_ttm, along_m, p0_m, p1_m)
-                if point_seg_dist_plane(pm, group_start, s1) > float(merge_max_dev):
+                t_mid2 = (float(group_t0) + float(t1)) * 0.5
+                _tt_m, _angle_m, along_m, px_m, py_m = spiral_point(t_mid2)
+                pt_mid = to_world(_tt_m, along_m, px_m, py_m)
+                if point_seg_dist_plane(pt_mid, group_start, world1) > float(merge_max_dev):
                     can_merge = False
 
             if can_merge and max_len > 0.0:
-                if seg_len_plane(group_start, s1) > max_len:
+                if seg_len_plane(group_start, world1) > max_len:
                     can_merge = False
 
             if not can_merge:
                 flush_group()
-                group_start = (float(s0[0]), float(s0[1]), float(s0[2]))
-                group_end = (float(s1[0]), float(s1[1]), float(s1[2]))
+                group_start = (float(world0[0]), float(world0[1]), float(world0[2]))
+                group_end = (float(world1[0]), float(world1[1]), float(world1[2]))
                 group_t0 = float(t0)
                 group_t1 = float(t1)
                 group_width = float(width)
@@ -311,7 +324,7 @@ def generate_spiral(cfg: SpiralConfig, *, phase_offset_rad: float = 0.0) -> list
                 group_rot_angle = float(rot_angle)
                 group_swap = bool(swap)
             else:
-                group_end = (float(s1[0]), float(s1[1]), float(s1[2]))
+                group_end = (float(world1[0]), float(world1[1]), float(world1[2]))
                 group_t1 = float(t1)
                 group_width = max(float(group_width), float(width))
                 group_thick = max(float(group_thick), float(thick))
@@ -319,8 +332,8 @@ def generate_spiral(cfg: SpiralConfig, *, phase_offset_rad: float = 0.0) -> list
         flush_group()
     else:
         for i in range(segs):
-            tm = 0.0 if segs <= 1 else float(i) / float(segs - 1)
-            tt, a, along, p0, p1 = spiral_point(tm)
+            t_mid = 0.0 if segs <= 1 else float(i) / float(segs - 1)
+            tt, angle_rad, along, px, py = spiral_point(t_mid)
 
             width = _lerp(float(cfg.width_outer), float(cfg.width_inner), tt)
             width = max(0.01, float(width))
@@ -328,25 +341,25 @@ def generate_spiral(cfg: SpiralConfig, *, phase_offset_rad: float = 0.0) -> list
             tlen = max(0.01, float(tlen))
             thick = max(0.01, float(cfg.axis_thickness))
 
-            tangent_rad = a + (math.pi * 0.5)
+            tangent_rad = angle_rad + (math.pi * 0.5)
             dir_deg = _canonical_direction_deg(math.degrees(tangent_rad))
 
             if plane == "XZ":
-                x, y, z = cx + p0, cy + along, cz + p1
+                x, y, z = cx + px, cy + along, cz + py
                 rot_in = -float(dir_deg)
                 if cfg.reverse_rotation:
                     rot_in = -float(rot_in)
                 swap, reduced = _reduce_to_limited_rotation(rot_in)
                 rot_axis = "y"
             elif plane == "XY":
-                x, y, z = cx + p0, cy + p1, cz + along
+                x, y, z = cx + px, cy + py, cz + along
                 rot_in = float(dir_deg)
                 if cfg.reverse_rotation:
                     rot_in = -float(rot_in)
                 swap, reduced = _reduce_to_limited_rotation(rot_in)
                 rot_axis = "z"
             else:
-                x, y, z = cx + along, cy + p0, cz + p1
+                x, y, z = cx + along, cy + px, cz + py
                 rot_in = float(dir_deg)
                 if cfg.reverse_rotation:
                     rot_in = -float(rot_in)
@@ -354,9 +367,9 @@ def generate_spiral(cfg: SpiralConfig, *, phase_offset_rad: float = 0.0) -> list
                 rot_axis = "x"
 
             rot_angle = _quantize_angle(reduced) if cfg.use_rotations else 0.0
-            el = build_element(center=(x, y, z), width=width, thick=thick, tlen=tlen, rot_axis=rot_axis, rot_angle=rot_angle, swap=bool(swap))
-            if el is not None:
-                out.append(el)
+            elem = build_element(center=(x, y, z), width=width, thick=thick, tlen=tlen, rot_axis=rot_axis, rot_angle=rot_angle, swap=bool(swap))
+            if elem is not None:
+                out.append(elem)
 
     if bool(cfg.greedy_merge):
         out = _greedy_merge_aligned_adjacent(list(out), origin_step=float(cfg.snap_step))
@@ -365,28 +378,30 @@ def generate_spiral(cfg: SpiralConfig, *, phase_offset_rad: float = 0.0) -> list
 
 
 def generate_double_spiral(cfg: SpiralConfig, *, phase_offset_rad: float = 0.0) -> list[Cuboid]:
-    a = generate_spiral(cfg, phase_offset_rad=float(phase_offset_rad) + 0.0)
-    b = generate_spiral(cfg, phase_offset_rad=float(phase_offset_rad) + math.pi)
+    spiral_a = generate_spiral(cfg, phase_offset_rad=float(phase_offset_rad) + 0.0)
+    spiral_b = generate_spiral(cfg, phase_offset_rad=float(phase_offset_rad) + math.pi)
 
     out: list[Cuboid] = []
     seen: set[tuple] = set()
 
-    def key(c: Cuboid) -> tuple:
-        r = c.rotation
-        if r is None:
-            return (c.fr, c.to, None)
-        return (c.fr, c.to, str(r.axis), float(r.angle), r.origin)
+    def key(cub: Cuboid) -> tuple:
+        rot = cub.rotation
+        if rot is None:
+            return (cub.fr, cub.to, None)
+        return (cub.fr, cub.to, str(rot.axis), float(rot.angle), rot.origin)
 
-    for c in list(a) + list(b):
-        k = key(c)
-        if k in seen:
+    for cub in list(spiral_a) + list(spiral_b):
+        cub_key = key(cub)
+        if cub_key in seen:
             continue
-        seen.add(k)
-        out.append(c)
+        seen.add(cub_key)
+        out.append(cub)
 
     return out
 
 
+# endregion
+# region RADIAL
 def generate_radial_arrangement_4(
     cfg: SpiralConfig,
     shape: str,
@@ -399,17 +414,17 @@ def generate_radial_arrangement_4(
     base_center = (float(cfg.center[0]), float(cfg.center[1]), float(cfg.center[2]))
     out: list[Cuboid] = []
 
-    r = float(radius)
+    radius_val = float(radius)
     positions: list[tuple[float, float, float]] = [
-        (r, 0.0, 0.0),
-        (0.0, 0.0, r),
-        (-r, 0.0, 0.0),
-        (0.0, 0.0, -r),
+        (radius_val, 0.0, 0.0),
+        (0.0, 0.0, radius_val),
+        (-radius_val, 0.0, 0.0),
+        (0.0, 0.0, -radius_val),
     ]
 
-    for k in range(4):
-        phase_rad = math.radians(float(phase_offsets_deg[k]))
-        plane_k = str(planes[k])
+    for side_idx in range(4):
+        phase_rad = math.radians(float(phase_offsets_deg[side_idx]))
+        plane_k = str(planes[side_idx])
 
         cfg2 = SpiralConfig(
             center=base_center,
@@ -439,10 +454,11 @@ def generate_radial_arrangement_4(
         els = generate_shape(cfg2, str(shape), phase_offset_rad=phase_rad)
         els = _apply_depth_stagger(list(els), plane=str(plane_k), step=float(depth_stagger_step))
 
-        delta = positions[int(k)]
-        for c in list(els):
-            cc = _transform_cuboid_global(c, scale=1.0, offset=delta)
-            if cc is not None:
-                out.append(cc)
+        delta = positions[int(side_idx)]
+        for cub in list(els):
+            cub_xf = _transform_cuboid_global(cub, scale=1.0, offset=delta)
+            if cub_xf is not None:
+                out.append(cub_xf)
 
     return out
+# endregion

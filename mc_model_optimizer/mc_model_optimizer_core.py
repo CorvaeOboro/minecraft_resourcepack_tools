@@ -409,7 +409,7 @@ def _reduce_overlaps_group(
 ) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
     """Greedily trim boxes against each other to remove overlapping volume.
 
-    Every trim preserves the union volume of the group by construction
+      trim preserves the union volume of the group by construction
     (the trimmed-away part of A is always fully covered by the box B it was
     trimmed against). Iterates until no further single-box trim is possible.
     """
@@ -491,7 +491,7 @@ def _make_element_dict(
 
 
 # ---------------------------------------------------------------------------
-# Tab-based JSON formatter (Blockbench style)
+# Tab-based JSON formatter  
 # ---------------------------------------------------------------------------
 
 def format_blockbench_json(obj: dict) -> str:
